@@ -1,0 +1,47 @@
+name: zulip-platform
+label: Zulip
+kind: platform
+version: 0.1.0
+description: >
+  Zulip gateway adapter for Hermes Agent.
+  Maps Zulip streams to Hermes "projects" and Zulip topics to Hermes
+  sessions, so the agent gets a clean per-thread context. Supports
+  sending, receiving, emoji reactions, image uploads, message editing,
+  and proactively spawning new topics on subject changes.
+author: Tamas / Ange (Claude)
+
+requires_env:
+  - name: ZULIP_SITE
+    description: "Realm URL, e.g. https://zulip.example.com"
+    prompt: "Zulip realm URL"
+    password: false
+  - name: ZULIP_EMAIL
+    description: "Bot user email (Settings → Personal → Bots → Generic bot)"
+    prompt: "Bot email"
+    password: false
+  - name: ZULIP_API_KEY
+    description: "API key shown next to the bot in Zulip settings"
+    prompt: "Bot API key"
+    password: true
+
+optional_env:
+  - name: ZULIP_HOME_CHANNEL
+    description: 'Default destination for cron / send_message (format "stream:topic", e.g. "sandbox:announcements")'
+    prompt: "Default home channel (stream:topic)"
+    password: false
+  - name: ZULIP_ALLOWED_USERS
+    description: "Comma-separated bot-visible emails or @-mention names allowed to talk to the bot"
+    prompt: "Allowed users"
+    password: false
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: "Allow anyone in subscribed streams to talk to the bot (dev only — true/false)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: ZULIP_AUTO_CREATE_TOPICS
+    description: "If true, agent may open new topics on subject changes (default: true)"
+    prompt: "Allow agent to open new topics?"
+    password: false
+  - name: ZULIP_VERIFY_TLS
+    description: "Verify TLS certs on the realm (default true — set false for self-signed dev realms)"
+    prompt: "Verify TLS? (true/false)"
+    password: false
