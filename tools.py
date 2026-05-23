@@ -590,8 +590,58 @@ _TOOLS = (
 )
 
 
+def _register_composite_toolset() -> None:
+    """Register ``hermes-zulip`` as a composite toolset.
+
+    Without this, gateway-spawned Zulip sessions only get the 9 Zulip-specific
+    tools (because Hermes' ``get_toolset()`` finds an auto-built registry entry
+    for ``hermes-zulip`` and returns it before reaching the
+    ``hermes-<platform>``-aware fallback that would have merged in
+    ``_HERMES_CORE_TOOLS``). The user sees an agent without ``cronjob``,
+    ``terminal``, ``web_search``, ``memory``, etc.
+
+    Sister platforms (``hermes-telegram``, ``hermes-matrix``, …) are declared as
+    explicit composites in the core ``toolsets.py``. Plugin platforms have to
+    declare it themselves, which we do here.
+
+    Best-effort: if the core import fails we log and continue — the plugin's
+    Zulip-specific tools still register fine, just without the core bundle.
+    """
+    try:
+        from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+    except Exception:
+        logger.warning(
+            "[zulip] could not import core toolsets — hermes-zulip will only "
+            "expose Zulip-specific tools (no cron/terminal/web/memory). "
+            "Add 'zulip: [hermes-cli, hermes-zulip]' to platform_toolsets in "
+            "~/.hermes/config.yaml to work around."
+        )
+        return
+
+    zulip_tool_names = [name for name, *_ in _TOOLS]
+    TOOLSETS["hermes-zulip"] = {
+        "description": (
+            "Zulip platform toolset — full core CLI tools "
+            "(cron, terminal, web, memory, …) plus Zulip-specific tools."
+        ),
+        "tools": sorted(set(_HERMES_CORE_TOOLS) | set(zulip_tool_names)),
+        "includes": [],
+    }
+    logger.info(
+        "[zulip] registered composite toolset 'hermes-zulip' with %d tools "
+        "(%d core + %d zulip-specific)",
+        len(TOOLSETS["hermes-zulip"]["tools"]),
+        len(_HERMES_CORE_TOOLS),
+        len(zulip_tool_names),
+    )
+
+
 def register_tools(ctx) -> None:
     """Register all Zulip tools. Called from adapter.register()."""
+    # First: declare the composite toolset so gateway sessions get core tools.
+    _register_composite_toolset()
+
+    # Then: register each Zulip-specific tool into the same toolset name.
     for name, schema, handler, emoji in _TOOLS:
         ctx.register_tool(
             name=name,

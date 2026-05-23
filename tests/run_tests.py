@@ -424,6 +424,29 @@ def run_m4() -> int:
     _check("all have requires_env",
            all("ZULIP_SITE" in t["requires_env"] for t in registered))
 
+    # Composite-toolset registration: register_tools() must declare
+    # ``hermes-zulip`` as a composite in core ``toolsets.TOOLSETS`` so
+    # gateway-spawned sessions get core tools (cronjob, terminal, web, memory,
+    # …) alongside the Zulip-specific ones. Without this, the gateway hands
+    # the Zulip agent only the 9 Zulip tools — no scheduling, no shell, no web.
+    try:
+        from toolsets import TOOLSETS, resolve_toolset
+        ts = TOOLSETS.get("hermes-zulip")
+        _check("composite toolset registered in core", ts is not None)
+        resolved = set(resolve_toolset("hermes-zulip"))
+        _check("composite includes cronjob", "cronjob" in resolved)
+        _check("composite includes terminal", "terminal" in resolved)
+        _check("composite includes web_search", "web_search" in resolved)
+        _check("composite includes memory", "memory" in resolved)
+        _check("composite includes send_message", "send_message" in resolved)
+        _check("composite includes zulip_post", "zulip_post" in resolved)
+        _check("composite includes zulip_fetch", "zulip_fetch" in resolved)
+        _check("composite >= 40 tools (core + zulip)", len(resolved) >= 40)
+    except ImportError:
+        # Core not importable in this test env — skip gracefully (the
+        # plugin's own register_tools() also handles this case).
+        pass
+
     # Hint mentions zulip_post (the magic branching tool)
     from hermes_plugins.zulip.adapter import PLATFORM_HINT as HINT
     _check("PLATFORM_HINT names zulip_post", "zulip_post" in HINT)
