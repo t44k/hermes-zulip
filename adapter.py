@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import random
-from typing import Any, Dict, Optional
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
 )
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource
@@ -45,6 +50,19 @@ from .client import ZulipClient, ZulipAPIError
 PLATFORM_KEY = "zulip"
 MAX_MESSAGE_LENGTH = 10000  # Zulip's documented per-message limit
 DEFAULT_TOPIC = "(no topic)"
+
+# Markdown attachment pattern Zulip emits when a user pastes/uploads a file:
+#   [filename.png](/user_uploads/2/ab/cd/filename.png)
+# We extract these from the message ``content`` to drive inbound media handling.
+_USER_UPLOAD_LINK_RE = re.compile(r"\[([^\]]*)\]\((/user_uploads/[^\s)]+)\)")
+
+# Image extensions we promote to MessageType.PHOTO (everything else stays DOCUMENT).
+_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"})
+
+
+def _parse_user_uploads(content: str) -> List[Tuple[str, str]]:
+    """Extract (filename, uri) attachment links from a Zulip message body."""
+    return [(m.group(1) or "attachment", m.group(2)) for m in _USER_UPLOAD_LINK_RE.finditer(content or "")]
 
 # Bad-queue error code returned when our event queue has expired (~10 min idle).
 # We catch this in the event loop and re-register from scratch.
@@ -329,12 +347,43 @@ class ZulipAdapter(BasePlatformAdapter):
             message_id=str(m.get("id")),
         )
 
+        content = m.get("content", "") or ""
+        # ---- M5: inbound media ------------------------------------------
+        # Zulip embeds attachments as `[name](/user_uploads/...)` markdown.
+        # Download each, cache locally, and expose as media_urls. Promote the
+        # event type to PHOTO when *all* attachments are images; otherwise
+        # leave it as TEXT and let downstream tools open the cached paths.
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        uploads = _parse_user_uploads(content)
+        msg_type = MessageType.TEXT
+        for filename, uri in uploads:
+            try:
+                data = await self._client.download_user_upload(uri)
+            except Exception:
+                logger.exception("[zulip] failed to download attachment %s", uri)
+                continue
+            ext = Path(filename).suffix.lower() or ".bin"
+            mime, _ = mimetypes.guess_type(filename)
+            if ext in _IMAGE_EXTS:
+                cached = cache_image_from_bytes(data, ext=ext)
+                media_urls.append(cached)
+                media_types.append(mime or "image/png")
+            else:
+                cached = cache_document_from_bytes(data, filename=filename)
+                media_urls.append(cached)
+                media_types.append(mime or "application/octet-stream")
+        if media_urls and all(t.startswith("image/") for t in media_types):
+            msg_type = MessageType.PHOTO
+
         event = MessageEvent(
-            text=m.get("content", "") or "",
-            message_type=MessageType.TEXT,
+            text=content,
+            message_type=msg_type,
             source=source,
             raw_message=m,
             message_id=str(m.get("id")),
+            media_urls=media_urls,
+            media_types=media_types,
         )
         await self.handle_message(event)
 
@@ -415,9 +464,46 @@ class ZulipAdapter(BasePlatformAdapter):
         image_url: str,
         caption: Optional[str] = None,
         thread_id: Optional[str] = None,
+        **_kwargs: Any,
     ) -> SendResult:
-        # M5: download → /user_uploads → markdown link. For M1, just send the URL.
-        body = f"{caption}\n\n{image_url}" if caption else image_url
+        """Send an image to a Zulip stream/topic or DM.
+
+        ``image_url`` may be a local filesystem path or an http(s) URL. We
+        upload the bytes to Zulip's ``/user_uploads`` endpoint so the image
+        renders inline (rather than as a bare external link, which Zulip
+        sometimes hot-links and sometimes refuses to preview).
+        """
+        if not self._client:
+            return SendResult(success=False, error="zulip: not connected")
+        # Read or fetch the bytes
+        try:
+            if image_url.startswith("http://") or image_url.startswith("https://"):
+                import httpx
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as hc:
+                    r = await hc.get(image_url)
+                    if r.status_code != 200:
+                        return SendResult(success=False, error=f"fetch {image_url} → {r.status_code}")
+                    data = r.content
+                filename = Path(image_url.split("?", 1)[0]).name or "image"
+            else:
+                p = Path(image_url).expanduser()
+                if not p.exists():
+                    return SendResult(success=False, error=f"file not found: {p}")
+                data = p.read_bytes()
+                filename = p.name
+        except Exception as e:
+            logger.exception("[zulip] send_image: read failed")
+            return SendResult(success=False, error=f"read failed: {e}")
+
+        mime, _ = mimetypes.guess_type(filename)
+        try:
+            uri = await self._client.upload_file(filename, data, mime or "image/png")
+        except ZulipAPIError as e:
+            return SendResult(success=False, error=f"upload failed: {e}")
+
+        body = f"[{filename}]({uri})"
+        if caption:
+            body = f"{caption}\n\n{body}"
         return await self.send(chat_id, body, thread_id=thread_id)
 
     # ---------- introspection --------------------------------------------

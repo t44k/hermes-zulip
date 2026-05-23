@@ -253,3 +253,49 @@ class ZulipClient:
             )
         except Exception:
             logger.debug("[zulip] delete_event_queue failed (ignored)", exc_info=True)
+
+    # ---- M5: media endpoints ------------------------------------------
+
+    async def upload_file(
+        self,
+        filename: str,
+        data: bytes,
+        mime: str = "application/octet-stream",
+    ) -> str:
+        """Upload a file to Zulip. Returns the ``/user_uploads/...`` uri.
+
+        The returned uri is realm-relative (e.g. ``/user_uploads/2/ab/cd/foo.png``);
+        prefix with ``self.site`` to get an absolute URL for download.
+        """
+        resp = await self._request(
+            "POST",
+            "/user_uploads",
+            files={"file": (filename, data, mime)},
+        )
+        uri = resp.get("uri") or resp.get("url")
+        if not uri:
+            raise ZulipAPIError(0, "upload_no_uri", "upload returned no uri", raw=resp)
+        return uri
+
+    async def download_user_upload(self, uri: str) -> bytes:
+        """Download an authenticated Zulip attachment.
+
+        ``uri`` may be a full URL (``https://realm/user_uploads/...``) or the
+        realm-relative path (``/user_uploads/...``) as returned by the upload
+        endpoint and embedded in message markdown. Returns the raw bytes.
+        """
+        assert self._client is not None, "ZulipClient not connected"
+        # Normalise to an absolute URL against the realm root (not /api/v1).
+        if uri.startswith("http://") or uri.startswith("https://"):
+            url = uri
+        else:
+            if not uri.startswith("/"):
+                uri = "/" + uri
+            url = self.site + uri
+        resp = await self._client.get(url, timeout=self._timeout, follow_redirects=True)
+        if resp.status_code != 200:
+            raise ZulipAPIError(
+                resp.status_code, "download_failed",
+                f"GET {url} returned {resp.status_code}",
+            )
+        return resp.content

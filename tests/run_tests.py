@@ -413,8 +413,131 @@ def run_m4() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M5 tests: inbound media + send_image upload
+# --------------------------------------------------------------------------- #
+
+def run_m5() -> int:
+    """M5 — attachment parsing, inbound media download, send_image upload."""
+    import asyncio
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from hermes_plugins.zulip.adapter import (
+        ZulipAdapter, _parse_user_uploads, _IMAGE_EXTS,
+    )
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM5: attachment parsing")
+
+    cases = [
+        ("plain text no upload", []),
+        ("[bug.png](/user_uploads/2/ab/cd/bug.png)",
+         [("bug.png", "/user_uploads/2/ab/cd/bug.png")]),
+        ("two: [a.png](/user_uploads/2/aa/bb/a.png) and [b.pdf](/user_uploads/2/cc/dd/b.pdf)",
+         [("a.png", "/user_uploads/2/aa/bb/a.png"),
+          ("b.pdf", "/user_uploads/2/cc/dd/b.pdf")]),
+        ("empty name [](/user_uploads/2/x/y/z)",
+         [("attachment", "/user_uploads/2/x/y/z")]),
+        ("external link [doc](https://example.com/foo.png)", []),
+    ]
+    for text, want in cases:
+        got = _parse_user_uploads(text)
+        _check(f"parse {text[:40]!r}", got == want)
+
+    _check("png in _IMAGE_EXTS", ".png" in _IMAGE_EXTS)
+    _check("pdf NOT in _IMAGE_EXTS", ".pdf" not in _IMAGE_EXTS)
+
+    # ---- inbound media dispatch with a stubbed client ----
+    print("\nM5: inbound media dispatch")
+    cfg = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+    })
+    a = ZulipAdapter(cfg)
+    a._me = {"user_id": 11}
+    a._streams_by_id = {7: {"name": "sandbox", "stream_id": 7, "description": ""}}
+    a._streams_by_name = {"sandbox": a._streams_by_id[7]}
+
+    # Stub client with download_user_upload returning a 1x1 PNG.
+    PNG_1x1 = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00"
+        b"\x01\x00\x00\x05\x00\x01\x0d\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    class _StubClient:
+        async def download_user_upload(self, uri):
+            return PNG_1x1
+    a._client = _StubClient()
+
+    captured = []
+    async def _capture(ev):
+        captured.append(ev)
+    a.handle_message = _capture  # type: ignore[method-assign]
+
+    msg_image = {
+        "id": 901, "type": "stream", "sender_id": 8, "sender_full_name": "Tamas",
+        "display_recipient": "sandbox", "subject": "screenshots", "stream_id": 7,
+        "content": "look at this [screenshot.png](/user_uploads/2/aa/bb/screenshot.png)",
+    }
+    asyncio.run(a._handle_message_event(msg_image))
+    _check("dispatched 1 event", len(captured) == 1)
+    if captured:
+        ev = captured[0]
+        _check("type == PHOTO", ev.message_type == MessageType.PHOTO)
+        _check("1 media_url", len(ev.media_urls) == 1)
+        _check("media file exists", ev.media_urls and __import__("os").path.exists(ev.media_urls[0]))
+        _check("media_type is image/*", ev.media_types and ev.media_types[0].startswith("image/"))
+
+    # Mixed content (image + pdf) stays TEXT type but still carries both files
+    captured.clear()
+    msg_mixed = dict(msg_image)
+    msg_mixed["id"] = 902
+    msg_mixed["content"] = "[a.png](/user_uploads/2/x/y/a.png) and [b.pdf](/user_uploads/2/x/y/b.pdf)"
+    asyncio.run(a._handle_message_event(msg_mixed))
+    if captured:
+        ev = captured[0]
+        _check("mixed → 2 media", len(ev.media_urls) == 2)
+        _check("mixed stays TEXT", ev.message_type == MessageType.TEXT)
+
+    # ---- send_image upload path ----
+    print("\nM5: send_image upload")
+    sent: dict = {}
+    class _StubClient2:
+        async def upload_file(self, filename, data, mime):
+            sent["upload"] = (filename, len(data), mime)
+            return f"/user_uploads/9/zz/{filename}"
+        async def send_stream_message(self, stream, topic, content):
+            sent["send"] = (stream, topic, content)
+            return 12345
+    a._client = _StubClient2()
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+        tf.write(PNG_1x1)
+        local_path = tf.name
+    res = asyncio.run(a.send_image("stream:sandbox", local_path, caption="hi", thread_id="cats"))
+    _check("send_image success", res.success)
+    _check("upload was called", "upload" in sent and sent["upload"][1] == len(PNG_1x1))
+    _check("upload mime image/png", sent.get("upload", (None,None,None))[2] == "image/png")
+    _check("send was called", "send" in sent)
+    _check("send target topic", sent.get("send", (None,None,None))[1] == "cats")
+    _check("send body has upload uri", "/user_uploads/9/zz/" in (sent.get("send", (None,None,""))[2] or ""))
+    _check("send body has caption", "hi" in (sent.get("send", (None,None,""))[2] or ""))
+
+    # Missing local file
+    res2 = asyncio.run(a.send_image("stream:sandbox", "/nonexistent/file.png"))
+    _check("missing file → failure", not res2.success and "not found" in (res2.error or ""))
+
+    print(f"\nM5 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
     rc3 = run_m4()
-    sys.exit(rc1 | rc2 | rc3)
+    rc4 = run_m5()
+    sys.exit(rc1 | rc2 | rc3 | rc4)
