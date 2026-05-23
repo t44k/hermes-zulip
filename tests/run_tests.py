@@ -67,6 +67,8 @@ def _check(name: str, cond: bool, detail: str = "") -> None:
 # --------------------------------------------------------------------------- #
 
 def run() -> int:
+    global _passes, _failures
+    _passes = _failures = 0
     print("Loading plugin …")
     try:
         pkg = _load_plugin()
@@ -106,9 +108,20 @@ def run() -> int:
     _check("check_requirements() True (httpx installed)", check_requirements() is True)
 
     print("\nvalidate_config")
-    cfg = PlatformConfig(enabled=True, extra={})
-    ok, msg = validate_config(cfg)
-    _check("empty config rejected", not ok and "ZULIP_SITE" in msg)
+    # Strip env vars during this assertion — validate_config falls back to
+    # env vars when extra={} is supplied, and the gateway process running
+    # tests may have ZULIP_* exported (which would falsely pass the
+    # "rejected" check).
+    import os as _os
+    _saved_env = {k: _os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
+    try:
+        cfg = PlatformConfig(enabled=True, extra={})
+        ok, msg = validate_config(cfg)
+        _check("empty config rejected", not ok and "ZULIP_SITE" in msg)
+    finally:
+        for k, v in _saved_env.items():
+            if v is not None:
+                _os.environ[k] = v
     cfg2 = PlatformConfig(enabled=True, extra={
         "site": "https://zulip.example.com",
         "email": "ange-bot@example.com",
@@ -169,7 +182,7 @@ def run() -> int:
     _check("adapter.auto_create_topics default True", a.auto_create_topics is True)
     _check("adapter.verify_tls default True", a.verify_tls is True)
 
-    print(f"\n{_passes} passed, {_failures} failed")
+    print(f"\nM1 results: {_passes} passed, {_failures} failed")
     return 0 if _failures == 0 else 1
 
 
@@ -183,6 +196,8 @@ def run_m2() -> int:
     from gateway.config import PlatformConfig
     from hermes_plugins.zulip.adapter import ZulipAdapter, DEFAULT_TOPIC
 
+    global _passes, _failures
+    _passes = _failures = 0
     print("\nM2: message event dispatch")
 
     cfg = PlatformConfig(enabled=True, extra={
@@ -301,6 +316,8 @@ def run_m4() -> int:
     import os
     from unittest.mock import patch, AsyncMock, MagicMock
 
+    global _passes, _failures
+    _passes = _failures = 0
     print("\nM4: agent-facing tools")
 
     from hermes_plugins.zulip import tools as zt
