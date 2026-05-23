@@ -305,7 +305,7 @@ def run_m4() -> int:
     # Without env vars → tools should refuse cleanly
     saved = {k: os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
     try:
-        r = asyncio.run(zt._handle_zulip_post("s", "t", "hi"))
+        r = asyncio.run(zt._handle_zulip_post({"stream": "s", "topic": "t", "content": "hi"}))
         _check("post without env → error", r["success"] is False)
         _check("post error mentions env vars", "ZULIP_SITE" in r["error"])
         _check("check_zulip_available() False",
@@ -328,7 +328,7 @@ def run_m4() -> int:
     fake_client.__aexit__ = AsyncMock(return_value=None)
     fake_client.send_stream_message = AsyncMock(return_value=42)
     with patch.object(zt, "ZulipClient", return_value=fake_client):
-        r = asyncio.run(zt._handle_zulip_post("sandbox", "auth-bug", "hello"))
+        r = asyncio.run(zt._handle_zulip_post({"stream": "sandbox", "topic": "auth-bug", "content": "hello"}))
     _check("post.success", r["success"] is True)
     _check("post.message_id == 42", r["message_id"] == 42)
     _check("post.url has narrow", "/#narrow/stream/sandbox/topic/auth-bug/near/42" in r["url"])
@@ -340,18 +340,18 @@ def run_m4() -> int:
         side_effect=zt.ZulipAPIError(400, "BAD_REQUEST", "no such stream"),
     )
     with patch.object(zt, "ZulipClient", return_value=fake_client):
-        r = asyncio.run(zt._handle_zulip_post("nope", "t", "x"))
+        r = asyncio.run(zt._handle_zulip_post({"stream": "nope", "topic": "t", "content": "x"}))
     _check("post bubbles ZulipAPIError", r["success"] is False)
     _check("post error includes msg", "no such stream" in r["error"])
 
     # zulip_dm
     fake_client.send_direct_message = AsyncMock(return_value=7)
     with patch.object(zt, "ZulipClient", return_value=fake_client):
-        r = asyncio.run(zt._handle_zulip_dm(["tamas@359.wtf"], "hi"))
+        r = asyncio.run(zt._handle_zulip_dm({"recipients": ["tamas@359.wtf"], "content": "hi"}))
     _check("dm.success", r["success"] is True)
     _check("dm.message_id == 7", r["message_id"] == 7)
 
-    r = asyncio.run(zt._handle_zulip_dm([], "hi"))
+    r = asyncio.run(zt._handle_zulip_dm({"recipients": [], "content": "hi"}))
     _check("empty recipients rejected", r["success"] is False)
 
     # zulip_list_streams
@@ -360,7 +360,7 @@ def run_m4() -> int:
         {"name": "engineering", "stream_id": 8, "description": "Eng"},
     ])
     with patch.object(zt, "ZulipClient", return_value=fake_client):
-        r = asyncio.run(zt._handle_zulip_list_streams())
+        r = asyncio.run(zt._handle_zulip_list_streams({}))
     _check("list_streams count == 2", r["count"] == 2)
     _check("list_streams names", {s["name"] for s in r["streams"]} == {"sandbox", "engineering"})
 
@@ -370,7 +370,7 @@ def run_m4() -> int:
         {"name": "future-plans", "max_id": 95},
     ]})
     with patch.object(zt, "ZulipClient", return_value=fake_client):
-        r = asyncio.run(zt._handle_zulip_list_topics("sandbox"))
+        r = asyncio.run(zt._handle_zulip_list_topics({"stream": "sandbox"}))
     _check("list_topics count", r["count"] == 2)
     _check("list_topics ordering preserved",
            [t["name"] for t in r["topics"]] == ["auth-bug", "future-plans"])
@@ -378,12 +378,12 @@ def run_m4() -> int:
     # Unknown stream → not subscribed → error
     fake_client.get_subscriptions = AsyncMock(return_value=[])
     with patch.object(zt, "ZulipClient", return_value=fake_client):
-        r = asyncio.run(zt._handle_zulip_list_topics("ghost"))
+        r = asyncio.run(zt._handle_zulip_list_topics({"stream": "ghost"}))
     _check("list_topics rejects unknown stream", r["success"] is False)
     _check("list_topics error mentions stream", "ghost" in r["error"])
 
     # zulip_upload_image — file-not-found path
-    r = asyncio.run(zt._handle_zulip_upload_image("s", "t", "/nope/missing.png"))
+    r = asyncio.run(zt._handle_zulip_upload_image({"stream": "s", "topic": "t", "path": "/nope/missing.png"}))
     _check("upload_image rejects missing file", r["success"] is False)
     _check("upload_image error mentions path", "/nope/missing.png" in r["error"])
 
@@ -409,11 +409,12 @@ def run_m4() -> int:
     _check("PLATFORM_HINT names zulip_post", "zulip_post" in HINT)
     _check("PLATFORM_HINT names zulip_list_topics", "zulip_list_topics" in HINT)
 
-    # Regression: every handler must accept task_id (and any future) kwargs
-    # injected by the Hermes tool dispatcher. We don't run them — just confirm
-    # the signature accepts the extra kwarg without TypeError. (run_m4 in this
-    # process has stubbed mode set; the real handlers refuse upfront when
-    # ZULIP_SITE is missing.)
+    # Regression: every handler must follow the (args: dict, **kwargs) calling
+    # convention — the Hermes tool dispatcher invokes them as
+    # ``entry.handler(args, **kwargs)`` where ``args`` is the parsed JSON args
+    # dict and kwargs include execution-context keys (task_id, …). Handlers
+    # that took unpacked positional args (stream, topic, path, …) crashed live
+    # in #sandbox; this test pins the calling convention.
     import inspect
     from hermes_plugins.zulip.tools import (
         _handle_zulip_post, _handle_zulip_dm, _handle_zulip_list_streams,
@@ -422,8 +423,29 @@ def run_m4() -> int:
     for fn in (_handle_zulip_post, _handle_zulip_dm, _handle_zulip_list_streams,
                _handle_zulip_list_topics, _handle_zulip_upload_image):
         sig = inspect.signature(fn)
-        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        params = list(sig.parameters.values())
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
         _check(f"{fn.__name__} accepts **kwargs (task_id forward-compat)", has_var_kw)
+        # First positional must accept the args dict (named 'args' by
+        # convention; default OK for list_streams which has no required args).
+        positional = [p for p in params if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )]
+        _check(f"{fn.__name__} takes a single positional args dict",
+               len(positional) == 1 and positional[0].name == "args")
+        # Smoke: calling with a positional args dict + task_id kwarg must not TypeError.
+        try:
+            import asyncio as _aio
+            _aio.run(fn({}, task_id="probe"))
+            crashed = False
+        except TypeError as e:
+            crashed = True
+            print(f"   call-shape TypeError on {fn.__name__}: {e}")
+        except Exception:
+            # Any *runtime* error (e.g. missing env) is fine — we only fail on TypeError.
+            crashed = False
+        _check(f"{fn.__name__}(args={{}}, task_id=…) does not TypeError", not crashed)
 
     print(f"\nM4 results: {_passes} passed, {_failures} failed")
     return 0 if _failures == 0 else 1

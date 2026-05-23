@@ -177,7 +177,12 @@ ZULIP_UPLOAD_IMAGE_SCHEMA = {
 # Handlers (all async — registered with is_async=True)
 # --------------------------------------------------------------------------- #
 
-async def _handle_zulip_post(stream: str, topic: str, content: str, **_kwargs: Any) -> dict[str, Any]:
+async def _handle_zulip_post(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = args.get("stream", "")
+    topic = args.get("topic", "")
+    content = args.get("content", "")
+    if not stream or not topic:
+        return _err("stream and topic are required")
     c = _client()
     if c is None:
         return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
@@ -197,7 +202,9 @@ async def _handle_zulip_post(stream: str, topic: str, content: str, **_kwargs: A
     return {"success": True, "message_id": mid, "url": url}
 
 
-async def _handle_zulip_dm(recipients: list[str], content: str, **_kwargs: Any) -> dict[str, Any]:
+async def _handle_zulip_dm(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    recipients = args.get("recipients") or []
+    content = args.get("content", "")
     if not recipients:
         return _err("recipients must be a non-empty list of emails")
     c = _client()
@@ -211,7 +218,7 @@ async def _handle_zulip_dm(recipients: list[str], content: str, **_kwargs: Any) 
     return {"success": True, "message_id": mid}
 
 
-async def _handle_zulip_list_streams(**_kwargs: Any) -> dict[str, Any]:
+async def _handle_zulip_list_streams(args: dict | None = None, **_kwargs: Any) -> dict[str, Any]:
     c = _client()
     if c is None:
         return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
@@ -231,7 +238,11 @@ async def _handle_zulip_list_streams(**_kwargs: Any) -> dict[str, Any]:
     return {"success": True, "streams": out, "count": len(out)}
 
 
-async def _handle_zulip_list_topics(stream: str, limit: int = 25, **_kwargs: Any) -> dict[str, Any]:
+async def _handle_zulip_list_topics(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = args.get("stream", "")
+    limit = int(args.get("limit", 25) or 25)
+    if not stream:
+        return _err("stream is required")
     if limit < 1 or limit > 100:
         limit = max(1, min(limit, 100))
     c = _client()
@@ -256,9 +267,13 @@ async def _handle_zulip_list_topics(stream: str, limit: int = 25, **_kwargs: Any
     return {"success": True, "stream": stream, "topics": out, "count": len(out)}
 
 
-async def _handle_zulip_upload_image(
-    stream: str, topic: str, path: str, caption: str = "", **_kwargs: Any,
-) -> dict[str, Any]:
+async def _handle_zulip_upload_image(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = args.get("stream", "")
+    topic = args.get("topic", "")
+    path = args.get("path", "")
+    caption = args.get("caption", "") or ""
+    if not stream or not topic or not path:
+        return _err("stream, topic, and path are required")
     if not os.path.isfile(path):
         return _err(f"file not found: {path}")
     c = _client()
