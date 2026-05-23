@@ -82,6 +82,11 @@ PLATFORM_HINT = (
     "step required. Prefer short kebab-case topic names (≤60 chars). "
     "When you're unsure which topics already exist, call `zulip_list_topics(stream)`. "
     "Reply in the existing topic when continuing the same discussion. "
+    "**Incoming messages are prefixed with `[msg #<id>] …`** — that integer "
+    "is the Zulip message_id, the only reliable way to target the message "
+    "for reactions, edits, or quoted replies. Use it; do NOT guess IDs. "
+    "Strip the `[msg #N]` prefix from the user's text before reasoning about "
+    "the content. "
     "Zulip Markdown is supported: **bold**, *italic*, `code`, ```code blocks```, "
     "tables, spoilers (||spoiler||), and @-mentions like @**Tamas**. "
     "Messages can be edited; long streamed responses update in place. "
@@ -381,8 +386,18 @@ class ZulipAdapter(BasePlatformAdapter):
         if media_urls and all(t.startswith("image/") for t in media_types):
             msg_type = MessageType.PHOTO
 
+        # Prefix the message text with the Zulip message id so the agent can
+        # reliably target it for reactions, edits, and quoted replies without
+        # having to guess. Reaction events do the same with their #<id> tail.
+        # See PLATFORM_HINT for the contract.
+        zulip_msg_id = m.get("id")
+        if zulip_msg_id is not None:
+            display_text = f"[msg #{zulip_msg_id}] {content}" if content else f"[msg #{zulip_msg_id}]"
+        else:
+            display_text = content
+
         event = MessageEvent(
-            text=content,
+            text=display_text,
             message_type=msg_type,
             source=source,
             raw_message=m,

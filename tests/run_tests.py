@@ -217,6 +217,7 @@ def run_m2() -> int:
     _check("dispatched 1 event", len(dispatched) == 1)
     ev1 = dispatched[0]
     _check("ev1.text", "OAuth" in ev1.text)
+    _check("ev1.text is prefixed with msg id", ev1.text.startswith("[msg #100] "))
     _check("ev1.chat_id = stream:sandbox", ev1.source.chat_id == "stream:sandbox")
     _check("ev1.thread_id = auth-bug", ev1.source.thread_id == "auth-bug")
     _check("ev1.parent_chat_id = stream:sandbox",
@@ -395,7 +396,7 @@ def run_m4() -> int:
             registered.append(kw)
 
     zt.register_tools(_Ctx())
-    _check("registers 5 tools", len(registered) == 5)
+    _check("registers 6 tools", len(registered) == 6)
     _check("all in hermes-zulip toolset",
            {t["toolset"] for t in registered} == {"hermes-zulip"})
     _check("all async", all(t["is_async"] for t in registered))
