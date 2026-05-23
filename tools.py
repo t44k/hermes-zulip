@@ -235,6 +235,52 @@ ZULIP_DELETE_SCHEMA = {
 }
 
 
+ZULIP_FETCH_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_fetch",
+        "description": (
+            "Read recent message history from a Zulip stream/topic or DM. "
+            "Use this to summarise a thread, quote earlier messages, look "
+            "up the `[msg #N]` id of an old post you want to edit/delete, "
+            "or catch up on context before replying. "
+            "Provide EITHER (stream + optional topic) OR (anchor) — not "
+            "both. Returns {success, messages: [{id, sender, content, "
+            "timestamp, stream, topic}], found_oldest, found_newest}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stream": {
+                    "type": "string",
+                    "description": "Stream name to narrow to. Omit for cross-stream fetch.",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic within the stream. Requires `stream`. Omit to fetch the whole stream.",
+                },
+                "anchor": {
+                    "type": "string",
+                    "description": "Anchor message id (as a string) or one of 'newest'|'oldest'|'first_unread'. Default 'newest'.",
+                    "default": "newest",
+                },
+                "num_before": {
+                    "type": "integer",
+                    "description": "Number of messages BEFORE the anchor to fetch (default 20, max 1000).",
+                    "default": 20,
+                },
+                "num_after": {
+                    "type": "integer",
+                    "description": "Number of messages AFTER the anchor to fetch (default 0).",
+                    "default": 0,
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+
 ZULIP_REACT_SCHEMA = {
     "type": "function",
     "function": {
@@ -466,6 +512,67 @@ async def _handle_zulip_delete(args: dict, **_kwargs: Any) -> dict[str, Any]:
     return {"success": True, "message_id": int(msg_id)}
 
 
+async def _handle_zulip_fetch(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = (args.get("stream") or "").strip()
+    topic = (args.get("topic") or "").strip()
+    anchor_raw = args.get("anchor", "newest")
+    num_before = int(args.get("num_before", 20) or 20)
+    num_after = int(args.get("num_after", 0) or 0)
+
+    if topic and not stream:
+        return _err("`topic` requires `stream`")
+
+    # Coerce anchor: numeric strings → int, sentinels stay as-is.
+    anchor: Any = anchor_raw
+    if isinstance(anchor_raw, str) and anchor_raw.isdigit():
+        anchor = int(anchor_raw)
+    elif isinstance(anchor_raw, str) and anchor_raw not in ("newest", "oldest", "first_unread"):
+        return _err("anchor must be a message id (int/numeric str) or 'newest'|'oldest'|'first_unread'")
+
+    narrow: list[dict] = []
+    if stream:
+        narrow.append({"operator": "stream", "operand": stream})
+    if topic:
+        narrow.append({"operator": "topic", "operand": topic})
+
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            resp = await c.get_messages(
+                anchor=anchor,
+                num_before=num_before,
+                num_after=num_after,
+                narrow=narrow or None,
+            )
+        except (ZulipAPIError, ValueError) as e:
+            return _err(str(e))
+
+    # Compact each message — full payloads are huge (rendered_content,
+    # avatar urls, reactions, ...). Agent only needs id/sender/content/route.
+    out_msgs = []
+    for m in resp.get("messages", []):
+        out_msgs.append({
+            "id": m.get("id"),
+            "sender_id": m.get("sender_id"),
+            "sender": m.get("sender_full_name") or m.get("sender_email"),
+            "timestamp": m.get("timestamp"),
+            "type": m.get("type"),
+            "stream": m.get("display_recipient") if m.get("type") == "stream" else None,
+            "topic": m.get("subject") if m.get("type") == "stream" else None,
+            "content": m.get("content", ""),
+        })
+    return {
+        "success": True,
+        "count": len(out_msgs),
+        "messages": out_msgs,
+        "found_oldest": bool(resp.get("found_oldest")),
+        "found_newest": bool(resp.get("found_newest")),
+        "anchor": resp.get("anchor"),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Registration
 # --------------------------------------------------------------------------- #
@@ -479,6 +586,7 @@ _TOOLS = (
     ("zulip_react",        ZULIP_REACT_SCHEMA,        _handle_zulip_react,        "✨"),
     ("zulip_edit",         ZULIP_EDIT_SCHEMA,         _handle_zulip_edit,         "✏️"),
     ("zulip_delete",       ZULIP_DELETE_SCHEMA,       _handle_zulip_delete,       "🗑️"),
+    ("zulip_fetch",        ZULIP_FETCH_SCHEMA,        _handle_zulip_fetch,        "📜"),
 )
 
 

@@ -396,7 +396,7 @@ def run_m4() -> int:
             registered.append(kw)
 
     zt.register_tools(_Ctx())
-    _check("registers 6 tools", len(registered) == 6)
+    _check("registers ≥6 tools", len(registered) >= 6)
     _check("all in hermes-zulip toolset",
            {t["toolset"] for t in registered} == {"hermes-zulip"})
     _check("all async", all(t["is_async"] for t in registered))
@@ -1065,9 +1065,168 @@ def run_m8() -> int:
     names = [t[0] for t in zt._TOOLS]
     _check("zulip_edit registered", "zulip_edit" in names)
     _check("zulip_delete registered", "zulip_delete" in names)
-    _check("tool count == 8", len(names) == 8)
+    _check("tool count >= 8", len(names) >= 8)
 
     print(f"\nM8 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
+# --------------------------------------------------------------------------- #
+# M9 tests: outgoing ID tagging + zulip_fetch
+# --------------------------------------------------------------------------- #
+
+def run_m9() -> int:
+    """M9 — auto-tag outbound [msg #N] + zulip_fetch history tool."""
+    import asyncio
+    import os as _os
+    from unittest.mock import AsyncMock, patch
+    from gateway.config import PlatformConfig
+    from hermes_plugins.zulip.adapter import ZulipAdapter
+    from hermes_plugins.zulip import tools as zt
+
+    global _passes, _failures
+    _passes = _failures = 0
+
+    # ---- outbound ID tagging ----
+    print("\nM9: outbound [msg #N] auto-tag")
+    cfg = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+    })
+    a = ZulipAdapter(cfg)
+    a._me = {"user_id": 11, "email": "ange-bot@example.com"}
+    a._client = AsyncMock()
+    a._client.send_stream_message = AsyncMock(return_value=12345)
+    a._client.send_direct_message = AsyncMock(return_value=12346)
+    a._client.update_message = AsyncMock(return_value={"result": "success"})
+
+    # 1) Stream send tags
+    r = asyncio.run(a.send("stream:sandbox", "hello world", thread_id="t"))
+    _check("stream send success", r.success and r.message_id == "12345")
+    a._client.update_message.assert_awaited_with(
+        12345, content="[msg #12345] hello world",
+    )
+
+    # 2) DM send tags
+    a._client.update_message.reset_mock()
+    r = asyncio.run(a.send("dm:tamas@359.wtf", "ping"))
+    _check("dm send success", r.success and r.message_id == "12346")
+    a._client.update_message.assert_awaited_with(
+        12346, content="[msg #12346] ping",
+    )
+
+    # 3) Already-tagged body → skip re-tag
+    a._client.update_message.reset_mock()
+    asyncio.run(a.send("stream:sandbox", "[msg #99] already tagged", thread_id="t"))
+    _check("pre-tagged body skips re-tag",
+           a._client.update_message.await_count == 0)
+
+    # 4) Disabled flag → no PATCH
+    a.tag_outgoing_ids = False
+    a._client.update_message.reset_mock()
+    asyncio.run(a.send("stream:sandbox", "no tag please", thread_id="t"))
+    _check("disabled flag → no update_message",
+           a._client.update_message.await_count == 0)
+    a.tag_outgoing_ids = True
+
+    # 5) PATCH failure is non-fatal — send still returns success
+    a._client.update_message.reset_mock()
+    a._client.update_message.side_effect = RuntimeError("boom")
+    r = asyncio.run(a.send("stream:sandbox", "still works", thread_id="t"))
+    _check("PATCH failure swallowed; send succeeds",
+           r.success and r.message_id == "12345")
+    a._client.update_message.side_effect = None
+
+    # ---- zulip_fetch tool ----
+    print("\nM9: zulip_fetch tool")
+    saved = {k: _os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
+    try:
+        r = asyncio.run(zt._handle_zulip_fetch({"stream": "sandbox"}))
+        _check("fetch without env → error", not r["success"])
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                _os.environ[k] = v
+
+    _os.environ["ZULIP_SITE"] = "https://zulip.example.com"
+    _os.environ["ZULIP_EMAIL"] = "ange-bot@example.com"
+    _os.environ["ZULIP_API_KEY"] = "k"
+
+    fake_msgs = {
+        "messages": [
+            {
+                "id": 100, "sender_id": 8, "sender_full_name": "Tamas",
+                "timestamp": 1700000000, "type": "stream",
+                "display_recipient": "sandbox", "subject": "auth-bug",
+                "content": "the bug is in auth.py",
+            },
+            {
+                "id": 101, "sender_id": 11, "sender_full_name": "Ange",
+                "timestamp": 1700000010, "type": "stream",
+                "display_recipient": "sandbox", "subject": "auth-bug",
+                "content": "[msg #101] looking into it",
+            },
+        ],
+        "found_oldest": False,
+        "found_newest": True,
+        "anchor": 101,
+    }
+    fake_client = AsyncMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.get_messages = AsyncMock(return_value=fake_msgs)
+
+    # 1) stream + topic narrow
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_fetch({
+            "stream": "sandbox", "topic": "auth-bug", "num_before": 5,
+        }))
+    _check("fetch success", r["success"])
+    _check("fetch count == 2", r["count"] == 2)
+    _check("fetch compact: id present", r["messages"][0]["id"] == 100)
+    _check("fetch compact: sender present", r["messages"][0]["sender"] == "Tamas")
+    _check("fetch compact: stream/topic", r["messages"][0]["stream"] == "sandbox" and r["messages"][0]["topic"] == "auth-bug")
+    fake_client.get_messages.assert_awaited_with(
+        anchor="newest", num_before=5, num_after=0,
+        narrow=[
+            {"operator": "stream", "operand": "sandbox"},
+            {"operator": "topic", "operand": "auth-bug"},
+        ],
+    )
+
+    # 2) numeric anchor string coerced to int
+    fake_client.get_messages.reset_mock()
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        asyncio.run(zt._handle_zulip_fetch({"anchor": "555", "num_before": 3}))
+    args = fake_client.get_messages.await_args
+    _check("numeric anchor str coerced to int", args.kwargs["anchor"] == 555)
+
+    # 3) topic without stream → error
+    r = asyncio.run(zt._handle_zulip_fetch({"topic": "x"}))
+    _check("topic w/o stream → error", not r["success"])
+
+    # 4) invalid anchor → error
+    r = asyncio.run(zt._handle_zulip_fetch({"anchor": "bogus"}))
+    _check("invalid anchor → error", not r["success"])
+
+    # 5) Registry
+    names = [t[0] for t in zt._TOOLS]
+    _check("zulip_fetch registered", "zulip_fetch" in names)
+    _check("tool count == 9", len(names) == 9)
+
+    # 6) client.get_messages anchor validation
+    print("\nM9: client.get_messages guards")
+    from hermes_plugins.zulip.client import ZulipClient
+    c = ZulipClient("https://x", "e", "k")
+    try:
+        asyncio.run(c.get_messages(anchor="weird"))
+    except ValueError:
+        _check("client rejects bad anchor", True)
+    else:
+        _check("client rejects bad anchor", False, "expected ValueError")
+
+    print(f"\nM9 results: {_passes} passed, {_failures} failed")
     return 0 if _failures == 0 else 1
 
 
@@ -1079,4 +1238,5 @@ if __name__ == "__main__":
     rc5 = run_m6()
     rc6 = run_m6_polish()
     rc7 = run_m8()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7)
+    rc8 = run_m9()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8)

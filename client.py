@@ -378,3 +378,44 @@ class ZulipClient:
             params={"apply_markdown": "false"},
         )
         return resp.get("message") or resp
+
+    # ---- M9: history fetch -------------------------------------------
+
+    async def get_messages(
+        self,
+        *,
+        anchor: str | int = "newest",
+        num_before: int = 20,
+        num_after: int = 0,
+        narrow: list[dict] | None = None,
+        apply_markdown: bool = False,
+    ) -> dict:
+        """Fetch a page of message history.
+
+        ``anchor`` accepts a numeric message id or one of Zulip's sentinels:
+          ``"newest"``, ``"oldest"``, ``"first_unread"``.
+
+        ``narrow`` is a list of filters in Zulip's narrow format, e.g.::
+
+            [{"operator": "stream", "operand": "sandbox"},
+             {"operator": "topic",  "operand": "auth-bug"}]
+
+        Returns the raw register payload (``messages``, ``found_oldest``,
+        ``found_newest``, ``anchor``) so callers can paginate.
+        """
+        if not isinstance(anchor, int) and anchor not in ("newest", "oldest", "first_unread"):
+            raise ValueError(
+                "anchor must be an int message id or one of 'newest'/'oldest'/'first_unread'"
+            )
+        num_before = max(0, min(int(num_before), 1000))
+        num_after = max(0, min(int(num_after), 1000))
+        params: dict[str, Any] = {
+            "anchor": anchor,
+            "num_before": num_before,
+            "num_after": num_after,
+            "apply_markdown": "true" if apply_markdown else "false",
+        }
+        if narrow:
+            import json as _json
+            params["narrow"] = _json.dumps(narrow)
+        return await self._request("GET", "/messages", params=params)

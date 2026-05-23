@@ -86,7 +86,13 @@ PLATFORM_HINT = (
     "is the Zulip message_id, the only reliable way to target the message "
     "for reactions, edits, or quoted replies. Use it; do NOT guess IDs. "
     "Strip the `[msg #N]` prefix from the user's text before reasoning about "
-    "the content. "
+    "the content. Your own outbound messages are also auto-tagged with "
+    "`[msg #N]` after sending, so when you scroll back via `zulip_fetch` you "
+    "can identify your own past posts. "
+    "To read the conversation history of a topic or DM (e.g. to summarise, "
+    "quote, edit, or delete an earlier message you don't see in this turn), "
+    "call `zulip_fetch(stream=..., topic=..., num_before=N)` or "
+    "`zulip_fetch(anchor=<id>, num_before=N, num_after=M)`. "
     "Zulip Markdown is supported: **bold**, *italic*, `code`, ```code blocks```, "
     "tables, spoilers (||spoiler||), and @-mentions like @**Tamas**. "
     "Messages can be edited; long streamed responses update in place. "
@@ -170,6 +176,16 @@ class ZulipAdapter(BasePlatformAdapter):
         self.seen_emoji: str = (
             extra.get("seen_emoji") or os.getenv("ZULIP_SEEN_EMOJI", "eyes")
         ).lstrip(":").rstrip(":").strip() or "eyes"
+        # ---- M9: tag outbound messages with their own [msg #N] prefix ----
+        # When the bot scrolls back through a thread via zulip_fetch, the
+        # only way it can identify its OWN past messages is if their ids
+        # are baked into the content. After every successful send we
+        # PATCH the just-posted message to prepend "[msg #N] " (mirroring
+        # the inbound prefix). Single extra round-trip; self-edit event
+        # is filtered upstream so this doesn't cause feedback loops.
+        self.tag_outgoing_ids: bool = _truthy(
+            extra.get("tag_outgoing_ids", os.getenv("ZULIP_TAG_OUTGOING_IDS", "true"))
+        )
 
         self._client: Optional[ZulipClient] = None
         self._me: dict = {}
@@ -759,6 +775,24 @@ class ZulipAdapter(BasePlatformAdapter):
             else:  # dm
                 recipients = [e.strip() for e in val.split(",") if e.strip()]
                 msg_id = await self._client.send_direct_message(recipients, body)
+            # M9: prepend [msg #N] so the bot can identify its own messages
+            # when scrolling history via zulip_fetch. Skip if the body already
+            # carries the prefix (e.g. the agent included it manually), or if
+            # the post was an internal helper that turned around and posted a
+            # bare ID marker.
+            if (
+                self.tag_outgoing_ids
+                and body
+                and not body.lstrip().startswith("[msg #")
+            ):
+                tagged = f"[msg #{msg_id}] {body}"
+                try:
+                    await self._client.update_message(int(msg_id), content=tagged)
+                except Exception:
+                    logger.debug(
+                        "[zulip] outgoing-id tag failed for msg=%s (non-fatal)",
+                        msg_id, exc_info=True,
+                    )
             return SendResult(success=True, message_id=str(msg_id))
         except ZulipAPIError as e:
             logger.error("[zulip] send failed: %s", e)
