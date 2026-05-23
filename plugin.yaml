@@ -41,6 +41,16 @@ optional_env:
     description: "If true, agent may open new topics on subject changes (default: true)"
     prompt: "Allow agent to open new topics?"
     password: false
+
+  - name: ZULIP_AUTO_SEEN_REACTION
+    description: "If true, automatically add :eyes: to every inbound message and remove on successful turn completion (default: true)"
+    prompt: "Auto seen/done reaction? (true/false)"
+    password: false
+
+  - name: ZULIP_SEEN_EMOJI
+    description: "Emoji short-name to use for the seen-reaction (default: eyes). E.g. 'eyes', 'mag', 'see_no_evil'."
+    prompt: "Seen-emoji short-name"
+    password: false
   - name: ZULIP_VERIFY_TLS
     description: "Verify TLS certs on the realm (default true — set false for self-signed dev realms)"
     prompt: "Verify TLS? (true/false)"

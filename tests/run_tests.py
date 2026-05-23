@@ -713,10 +713,176 @@ def run_m6() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M6 polish: "seen / done" eye-reaction lifecycle
+# --------------------------------------------------------------------------- #
+
+def run_m6_polish() -> int:
+    """Auto eye-reaction on inbound + removal when the turn task completes."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+    from hermes_plugins.zulip.adapter import ZulipAdapter
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM6 polish: eye-reaction lifecycle")
+
+    def _mk_adapter() -> ZulipAdapter:
+        cfg = PlatformConfig(enabled=True, extra={
+            "site": "https://zulip.example.com",
+            "email": "ange-bot@example.com",
+            "api_key": "k",
+        })
+        a = ZulipAdapter(cfg)
+        a._me = {"user_id": 11}
+        a._streams_by_id = {7: {"name": "sandbox", "stream_id": 7}}
+        a._streams_by_name = {"sandbox": a._streams_by_id[7]}
+        a._client = AsyncMock()
+        a._client.add_reaction = AsyncMock(return_value=None)
+        a._client.remove_reaction = AsyncMock(return_value=None)
+        return a
+
+    def _mk_event(mid="555", text="hello", source_msg_id="555"):
+        src = SessionSource(
+            platform=Platform("zulip"),
+            chat_id="stream:sandbox",
+            chat_name="#sandbox",
+            chat_type="channel",
+            user_id="8",
+            user_name="Tamas",
+            thread_id="auth-bug",
+            parent_chat_id="stream:sandbox",
+            message_id=source_msg_id,
+        )
+        return MessageEvent(text=text, message_type=MessageType.TEXT, source=src, message_id=mid)
+
+    # 1) Successful turn — eye added then removed
+    async def _scenario_success():
+        a = _mk_adapter()
+        completed = asyncio.Event()
+        async def _fake_turn():
+            await asyncio.sleep(0.01)
+        ev = _mk_event()
+
+        # Stub super().handle_message to register a task on _session_tasks (the
+        # base class spawns its own background task; we mimic just enough for
+        # the wrapper to find one).
+        captured_task: list[asyncio.Task] = []
+        async def _stub_super(self, event):
+            t = asyncio.create_task(_fake_turn())
+            self._session_tasks["k"] = t
+            captured_task.append(t)
+        # Patch super class method
+        from gateway.platforms.base import BasePlatformAdapter
+        orig = BasePlatformAdapter.handle_message
+        BasePlatformAdapter.handle_message = _stub_super  # type: ignore[assignment]
+        try:
+            await a.handle_message(ev)
+            assert captured_task, "stub did not spawn a task"
+            await captured_task[0]
+            # Allow done callback to schedule removal + run
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            BasePlatformAdapter.handle_message = orig  # type: ignore[assignment]
+        return a
+
+    a1 = asyncio.run(_scenario_success())
+    _check("success: add_reaction called once", a1._client.add_reaction.await_count == 1)
+    _check("success: add_reaction(:eyes:, mid=555)",
+           a1._client.add_reaction.call_args.args == (555, "eyes"))
+    _check("success: remove_reaction called once",
+           a1._client.remove_reaction.await_count == 1)
+    _check("success: remove_reaction(:eyes:, mid=555)",
+           a1._client.remove_reaction.call_args.args == (555, "eyes"))
+
+    # 2) Turn raises — eye stays in place
+    async def _scenario_failure():
+        a = _mk_adapter()
+        async def _crashy_turn():
+            await asyncio.sleep(0.01)
+            raise RuntimeError("agent crashed")
+        captured_task: list[asyncio.Task] = []
+        async def _stub_super(self, event):
+            t = asyncio.create_task(_crashy_turn())
+            self._session_tasks["k"] = t
+            captured_task.append(t)
+        from gateway.platforms.base import BasePlatformAdapter
+        orig = BasePlatformAdapter.handle_message
+        BasePlatformAdapter.handle_message = _stub_super  # type: ignore[assignment]
+        try:
+            await a.handle_message(_mk_event())
+            # Allow the turn to crash + done callback to fire
+            try:
+                await captured_task[0]
+            except RuntimeError:
+                pass
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            BasePlatformAdapter.handle_message = orig  # type: ignore[assignment]
+        return a
+
+    a2 = asyncio.run(_scenario_failure())
+    _check("failure: add_reaction called", a2._client.add_reaction.await_count == 1)
+    _check("failure: remove_reaction NOT called",
+           a2._client.remove_reaction.await_count == 0)
+
+    # 3) Reaction synthetic event (non-numeric msg_id) — no add at all
+    async def _scenario_synthetic():
+        a = _mk_adapter()
+        async def _stub_super(self, event): pass
+        from gateway.platforms.base import BasePlatformAdapter
+        orig = BasePlatformAdapter.handle_message
+        BasePlatformAdapter.handle_message = _stub_super  # type: ignore[assignment]
+        try:
+            ev = _mk_event(mid="reaction:555:thumbs_up", source_msg_id="reaction:555:thumbs_up")
+            await a.handle_message(ev)
+        finally:
+            BasePlatformAdapter.handle_message = orig  # type: ignore[assignment]
+        return a
+
+    a3 = asyncio.run(_scenario_synthetic())
+    _check("synthetic reaction event: no add_reaction",
+           a3._client.add_reaction.await_count == 0)
+
+    # 4) auto_seen_reaction=False — disabled, no add
+    async def _scenario_disabled():
+        a = _mk_adapter()
+        a.auto_seen_reaction = False
+        async def _stub_super(self, event): pass
+        from gateway.platforms.base import BasePlatformAdapter
+        orig = BasePlatformAdapter.handle_message
+        BasePlatformAdapter.handle_message = _stub_super  # type: ignore[assignment]
+        try:
+            await a.handle_message(_mk_event())
+        finally:
+            BasePlatformAdapter.handle_message = orig  # type: ignore[assignment]
+        return a
+
+    a4 = asyncio.run(_scenario_disabled())
+    _check("disabled: no add_reaction", a4._client.add_reaction.await_count == 0)
+
+    # 5) Custom seen_emoji via config
+    cfg5 = PlatformConfig(enabled=True, extra={
+        "site": "s", "email": "e", "api_key": "k", "seen_emoji": ":sparkles:",
+    })
+    a5 = ZulipAdapter(cfg5)
+    _check("custom seen_emoji strips colons", a5.seen_emoji == "sparkles")
+
+    print(f"\nM6 polish results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
     rc3 = run_m4()
     rc4 = run_m5()
     rc5 = run_m6()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5)
+    rc6 = run_m6_polish()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6)

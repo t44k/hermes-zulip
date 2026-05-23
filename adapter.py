@@ -149,6 +149,19 @@ class ZulipAdapter(BasePlatformAdapter):
         self.auto_create_topics: bool = _truthy(
             extra.get("auto_create_topics", os.getenv("ZULIP_AUTO_CREATE_TOPICS", "true"))
         )
+        # ---- M6 polish: seen / done eye-reactions ----
+        # When enabled, every inbound message gets a :seen_emoji: reaction
+        # the moment it arrives; the reaction is removed when the agent's
+        # background turn task completes (success OR failure — leaving the
+        # eye on a crash is a clearer signal than silently removing it on
+        # an empty/error reply, so we *only* clean up on successful turn
+        # completion via the done-callback's exception check).
+        self.auto_seen_reaction: bool = _truthy(
+            extra.get("auto_seen_reaction", os.getenv("ZULIP_AUTO_SEEN_REACTION", "true"))
+        )
+        self.seen_emoji: str = (
+            extra.get("seen_emoji") or os.getenv("ZULIP_SEEN_EMOJI", "eyes")
+        ).lstrip(":").rstrip(":").strip() or "eyes"
 
         self._client: Optional[ZulipClient] = None
         self._me: dict = {}
@@ -406,6 +419,106 @@ class ZulipAdapter(BasePlatformAdapter):
             media_types=media_types,
         )
         await self.handle_message(event)
+
+    # ---------- M6 polish: "seen / done" eye-reaction lifecycle ----------
+
+    async def handle_message(self, event: MessageEvent) -> None:  # type: ignore[override]
+        """Wrap the base handler with an inbound-message "seen / done"
+        reaction lifecycle.
+
+        Flow:
+          1. Add :eyes: to the inbound message immediately (so the user
+             knows the bot saw their message even before the LLM responds).
+          2. Delegate to ``super().handle_message`` which spawns the agent
+             turn as a background task.
+          3. Hook the background task's completion via add_done_callback so
+             the reaction is removed on success and *left in place* on
+             exception (clearer signal — eye lingers if the bot crashed).
+
+        Skipped when ``auto_seen_reaction`` is False, on synthetic reaction
+        events (message_id like ``reaction:N:emoji``), and when the message
+        was authored by the bot itself (no double-add).
+        """
+        if not (self.auto_seen_reaction and self._client):
+            await super().handle_message(event)
+            return
+
+        # Only attempt on numeric Zulip message ids — reaction events embed
+        # their own marker ("reaction:<id>:<emoji>") and shouldn't get eyes.
+        raw_mid = event.message_id
+        try:
+            zulip_mid = int(raw_mid) if raw_mid is not None else None
+        except (TypeError, ValueError):
+            zulip_mid = None
+        if zulip_mid is None:
+            await super().handle_message(event)
+            return
+
+        emoji = self.seen_emoji
+        # Add :eyes: first (best-effort — never block dispatch on a reaction
+        # failure; surface to debug log).
+        try:
+            await self._client.add_reaction(zulip_mid, emoji)
+        except Exception:
+            logger.debug("[zulip] seen-reaction add failed for msg=%s", zulip_mid, exc_info=True)
+
+        # Snapshot pre-dispatch session task set so we can identify the new
+        # task this event spawns. The base implementation creates the task
+        # synchronously inside handle_message → _start_session_processing,
+        # so it's available immediately after the await returns.
+        before = set(self._session_tasks.values())
+        try:
+            await super().handle_message(event)
+        except Exception:
+            # Dispatch itself failed — remove the eye since no turn will run.
+            logger.exception("[zulip] super().handle_message raised; clearing :%s:", emoji)
+            asyncio.create_task(self._remove_seen_reaction(zulip_mid, emoji))
+            raise
+
+        new_tasks = [t for t in self._session_tasks.values() if t not in before]
+        if not new_tasks:
+            # No background task spawned (e.g. inline command dispatch path,
+            # or duplicate-event filtered upstream). Remove the eye now —
+            # the message has already been fully processed.
+            asyncio.create_task(self._remove_seen_reaction(zulip_mid, emoji))
+            return
+
+        task = new_tasks[-1]
+
+        def _on_turn_done(t: "asyncio.Task[Any]", _mid: int = zulip_mid, _emoji: str = emoji) -> None:
+            exc = None
+            try:
+                exc = t.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                exc = None
+            if exc is not None:
+                # Leave the eye in place to signal "saw, didn't finish".
+                logger.warning(
+                    "[zulip] turn for msg=%s ended with %s — leaving :%s: in place",
+                    _mid, type(exc).__name__, _emoji,
+                )
+                return
+            # Schedule removal on the running loop.
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._remove_seen_reaction(_mid, _emoji))
+
+        try:
+            task.add_done_callback(_on_turn_done)
+        except Exception:
+            # Some tests use plain object() sentinels — fall back to immediate
+            # removal so we don't leave the eye orphaned in synthetic flows.
+            asyncio.create_task(self._remove_seen_reaction(zulip_mid, emoji))
+
+    async def _remove_seen_reaction(self, msg_id: int, emoji: str) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.remove_reaction(msg_id, emoji)
+        except Exception:
+            logger.debug(
+                "[zulip] seen-reaction remove failed for msg=%s emoji=%s",
+                msg_id, emoji, exc_info=True,
+            )
 
     async def _handle_reaction_event(self, ev: dict) -> None:
         """Surface a user's reaction to the agent as a synthetic text message.
