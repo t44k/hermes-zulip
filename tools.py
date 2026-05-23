@@ -173,6 +173,40 @@ ZULIP_UPLOAD_IMAGE_SCHEMA = {
 }
 
 
+ZULIP_REACT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_react",
+        "description": (
+            "Add or remove an emoji reaction on a Zulip message. Use this for "
+            "lightweight acknowledgements (e.g. 👍 on a request) without "
+            "posting a full reply. Emoji name is Zulip's short name like "
+            "'thumbs_up', 'tada', 'eyes', 'check'. Returns {success}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "integer",
+                    "description": "ID of the message to react to.",
+                },
+                "emoji_name": {
+                    "type": "string",
+                    "description": "Zulip emoji short name (no colons), e.g. 'thumbs_up', 'tada', 'eyes', 'sparkles', 'check'.",
+                },
+                "op": {
+                    "type": "string",
+                    "enum": ["add", "remove"],
+                    "description": "Whether to add or remove the reaction (default: add).",
+                    "default": "add",
+                },
+            },
+            "required": ["message_id", "emoji_name"],
+        },
+    },
+}
+
+
 # --------------------------------------------------------------------------- #
 # Handlers (all async — registered with is_async=True)
 # --------------------------------------------------------------------------- #
@@ -304,6 +338,30 @@ async def _handle_zulip_upload_image(args: dict, **_kwargs: Any) -> dict[str, An
     return {"success": True, "message_id": mid, "file_url": file_uri}
 
 
+async def _handle_zulip_react(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    msg_id = args.get("message_id")
+    emoji_name = (args.get("emoji_name") or "").lstrip(":").rstrip(":").strip()
+    op = (args.get("op") or "add").lower()
+    if not msg_id:
+        return _err("message_id is required")
+    if not emoji_name:
+        return _err("emoji_name is required (Zulip short name, no colons)")
+    if op not in ("add", "remove"):
+        return _err("op must be 'add' or 'remove'")
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            if op == "add":
+                await c.add_reaction(int(msg_id), emoji_name)
+            else:
+                await c.remove_reaction(int(msg_id), emoji_name)
+        except ZulipAPIError as e:
+            return _err(str(e))
+    return {"success": True, "message_id": int(msg_id), "emoji_name": emoji_name, "op": op}
+
+
 # --------------------------------------------------------------------------- #
 # Registration
 # --------------------------------------------------------------------------- #
@@ -314,6 +372,7 @@ _TOOLS = (
     ("zulip_list_streams", ZULIP_LIST_STREAMS_SCHEMA, _handle_zulip_list_streams, "📋"),
     ("zulip_list_topics",  ZULIP_LIST_TOPICS_SCHEMA,  _handle_zulip_list_topics,  "🧵"),
     ("zulip_upload_image", ZULIP_UPLOAD_IMAGE_SCHEMA, _handle_zulip_upload_image, "🖼️"),
+    ("zulip_react",        ZULIP_REACT_SCHEMA,        _handle_zulip_react,        "✨"),
 )
 
 

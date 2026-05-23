@@ -30,11 +30,11 @@ auto-creates topics on first message.
 | Milestone | Description | State |
 |-----------|-------------|-------|
 | M1 | Plugin scaffold + send text to a stream/topic | ✅ |
-| M2 | Inbound event queue + self-filter + auth | … |
-| M3 | Threading semantics (one topic = one session) | … |
-| M4 | Outbound tools (`zulip_post`, `zulip_list_streams`, etc.) | … |
-| M5 | Image upload + inbound media | … |
-| M6 | Reactions (in + out) | … |
+| M2 | Inbound event queue + self-filter + auth | ✅ |
+| M3 | Threading semantics (one topic = one session) | ✅ |
+| M4 | Outbound tools (`zulip_post`, `zulip_list_streams`, etc.) | ✅ |
+| M5 | Image upload + inbound media | ✅ |
+| M6 | Reactions (in + out) | ✅ |
 | M7 | Cron delivery / standalone sender | scaffold present |
 | M8 | Message editing + delete + polish | … |
 

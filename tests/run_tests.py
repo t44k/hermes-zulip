@@ -573,9 +573,149 @@ def run_m5() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M6 tests: reactions (in + out)
+# --------------------------------------------------------------------------- #
+
+def run_m6() -> int:
+    """M6 — inbound reaction dispatch + zulip_react tool."""
+    import asyncio
+    import os as _os
+    from unittest.mock import AsyncMock, patch
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from hermes_plugins.zulip.adapter import ZulipAdapter
+    from hermes_plugins.zulip import tools as zt
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM6: inbound reaction dispatch")
+
+    cfg = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+    })
+    a = ZulipAdapter(cfg)
+    a._me = {"user_id": 11, "email": "ange-bot@example.com", "full_name": "Ange"}
+    a._streams_by_id = {7: {"name": "sandbox", "stream_id": 7}}
+    a._streams_by_name = {"sandbox": a._streams_by_id[7]}
+
+    captured: list = []
+    async def _capture(ev):
+        captured.append(ev)
+    a.handle_message = _capture  # type: ignore[method-assign]
+
+    # Stub client.get_message — returns a bot-authored stream message
+    bot_msg = {
+        "id": 555, "sender_id": 11, "type": "stream",
+        "display_recipient": "sandbox", "subject": "auth-bug",
+    }
+    user_msg = dict(bot_msg, id=556, sender_id=8)  # user-authored — out of scope
+
+    class _StubClient:
+        target = bot_msg
+        async def get_message(self, mid):
+            return type(self).target
+
+    a._client = _StubClient()
+
+    # 1) user reacts to bot's message — should dispatch
+    ev_add = {
+        "type": "reaction", "op": "add",
+        "user_id": 8, "user": {"full_name": "Tamas", "user_id": 8},
+        "message_id": 555, "emoji_name": "thumbs_up",
+    }
+    asyncio.run(a._handle_reaction_event(ev_add))
+    _check("user→bot reaction dispatched", len(captured) == 1)
+    if captured:
+        ev = captured[0]
+        _check("text contains user", "Tamas" in ev.text)
+        _check("text contains emoji", "thumbs_up" in ev.text)
+        _check("text mentions reaction", "reacted" in ev.text.lower())
+        _check("message_type TEXT", ev.message_type == MessageType.TEXT)
+        _check("routed to right stream",
+               ev.source.chat_id == "stream:sandbox")
+        _check("routed to right topic",
+               ev.source.thread_id == "auth-bug")
+        _check("user_name = Tamas",
+               ev.source.user_name == "Tamas")
+
+    # 2) bot's own reaction echo — should NOT dispatch
+    captured.clear()
+    ev_self = dict(ev_add, user_id=11, user={"full_name": "Ange", "user_id": 11})
+    asyncio.run(a._handle_reaction_event(ev_self))
+    _check("self-reaction filtered", len(captured) == 0)
+
+    # 3) "remove" op — should NOT dispatch
+    captured.clear()
+    asyncio.run(a._handle_reaction_event(dict(ev_add, op="remove")))
+    _check("remove op filtered", len(captured) == 0)
+
+    # 4) reaction on user-authored message — should NOT dispatch
+    captured.clear()
+    _StubClient.target = user_msg
+    asyncio.run(a._handle_reaction_event(dict(ev_add, message_id=556)))
+    _check("reaction on non-bot msg filtered", len(captured) == 0)
+
+    # ---- zulip_react tool ----
+    print("\nM6: zulip_react tool")
+    saved = {k: _os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
+    try:
+        r = asyncio.run(zt._handle_zulip_react({"message_id": 5, "emoji_name": "tada"}))
+        _check("react without env → error", r["success"] is False)
+        _check("react error mentions env", "ZULIP_SITE" in r["error"])
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                _os.environ[k] = v
+
+    # With env + mocked client
+    _os.environ["ZULIP_SITE"] = "https://zulip.example.com"
+    _os.environ["ZULIP_EMAIL"] = "ange-bot@example.com"
+    _os.environ["ZULIP_API_KEY"] = "k"
+    fake_client = AsyncMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.add_reaction = AsyncMock(return_value=None)
+    fake_client.remove_reaction = AsyncMock(return_value=None)
+
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_react({"message_id": 42, "emoji_name": "thumbs_up"}))
+    _check("react.success default add", r["success"] is True and r["op"] == "add")
+    fake_client.add_reaction.assert_awaited_with(42, "thumbs_up")
+
+    # Strip surrounding colons in emoji_name
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_react({"message_id": 42, "emoji_name": ":tada:"}))
+    _check("react strips colons from emoji_name", r["emoji_name"] == "tada")
+
+    # remove
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_react({"message_id": 99, "emoji_name": "eyes", "op": "remove"}))
+    _check("react remove dispatched", r["success"] is True and r["op"] == "remove")
+    fake_client.remove_reaction.assert_awaited_with(99, "eyes")
+
+    # Missing args
+    r = asyncio.run(zt._handle_zulip_react({"emoji_name": "tada"}))
+    _check("missing message_id → error", not r["success"])
+    r = asyncio.run(zt._handle_zulip_react({"message_id": 1, "emoji_name": ""}))
+    _check("missing emoji_name → error", not r["success"])
+    r = asyncio.run(zt._handle_zulip_react({"message_id": 1, "emoji_name": "x", "op": "bogus"}))
+    _check("invalid op → error", not r["success"])
+
+    # Registry — react tool must be present in _TOOLS
+    names = [t[0] for t in zt._TOOLS]
+    _check("zulip_react registered", "zulip_react" in names)
+
+    print(f"\nM6 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
     rc3 = run_m4()
     rc4 = run_m5()
-    sys.exit(rc1 | rc2 | rc3 | rc4)
+    rc5 = run_m6()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5)

@@ -299,3 +299,35 @@ class ZulipClient:
                 f"GET {url} returned {resp.status_code}",
             )
         return resp.content
+
+    # ---- M6: reaction endpoints ---------------------------------------
+
+    async def add_reaction(self, message_id: int, emoji_name: str) -> None:
+        """Add an emoji reaction to a message.
+
+        ``emoji_name`` is Zulip's short name (e.g. ``"thumbs_up"``, ``"tada"``).
+        Zulip handles the emoji_code / reaction_type lookup server-side when
+        only emoji_name is supplied.
+        """
+        await self._request(
+            "POST",
+            f"/messages/{int(message_id)}/reactions",
+            data={"emoji_name": emoji_name},
+        )
+
+    async def remove_reaction(self, message_id: int, emoji_name: str) -> None:
+        """Remove one of the bot's previous reactions from a message."""
+        await self._request(
+            "DELETE",
+            f"/messages/{int(message_id)}/reactions",
+            data={"emoji_name": emoji_name},
+        )
+
+    async def get_message(self, message_id: int) -> dict:
+        """Fetch a single message by id. Used to look up stream/topic for
+        reaction routing (Zulip reaction events don't include narrow info)."""
+        resp = await self._request(
+            "GET", f"/messages/{int(message_id)}",
+            params={"apply_markdown": "false"},
+        )
+        return resp.get("message") or resp

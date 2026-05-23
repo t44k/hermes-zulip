@@ -84,7 +84,13 @@ PLATFORM_HINT = (
     "Reply in the existing topic when continuing the same discussion. "
     "Zulip Markdown is supported: **bold**, *italic*, `code`, ```code blocks```, "
     "tables, spoilers (||spoiler||), and @-mentions like @**Tamas**. "
-    "Messages can be edited; long streamed responses update in place."
+    "Messages can be edited; long streamed responses update in place. "
+    "For lightweight acknowledgements (e.g. confirming you saw a request "
+    "before doing the work), call `zulip_react(message_id, emoji_name)` "
+    "instead of posting a one-word reply. Common short names: thumbs_up, "
+    "tada, eyes, check, sparkles. When the user reacts to one of your "
+    "messages, you receive a synthetic event `[<name> reacted :emoji: …]` — "
+    "treat it as a soft signal and only respond if it clearly invites a reply."
 )
 
 
@@ -292,8 +298,7 @@ class ZulipAdapter(BasePlatformAdapter):
             # M8 will use this for edit tracking. Log only for M2.
             logger.debug("[zulip] update_message: %s", ev.get("message_id"))
         elif etype == "reaction":
-            # M6 will dispatch reaction events to the agent. Log only for M2.
-            logger.debug("[zulip] reaction event: %s", ev)
+            await self._handle_reaction_event(ev)
         elif etype == "subscription":
             # Refresh our stream cache opportunistically
             try:
@@ -384,6 +389,107 @@ class ZulipAdapter(BasePlatformAdapter):
             message_id=str(m.get("id")),
             media_urls=media_urls,
             media_types=media_types,
+        )
+        await self.handle_message(event)
+
+    async def _handle_reaction_event(self, ev: dict) -> None:
+        """Surface a user's reaction to the agent as a synthetic text message.
+
+        Zulip's reaction event payload:
+          {type: "reaction", op: "add"|"remove", message_id, emoji_name,
+           emoji_code, reaction_type, user_id, user: {...}}
+
+        We:
+          * skip our own reactions (echoes of zulip_react tool calls)
+          * skip "remove" events (noisy; agent only needs the add signal)
+          * look up the message to recover stream/topic for session routing
+          * skip reactions on messages NOT authored by the bot (avoid noise
+            on the user reacting to their own message or a third-party's)
+          * dispatch as a MessageEvent with text "<user> reacted :emoji: to
+            your message" — landing in the right session by message context
+        """
+        op = ev.get("op")
+        if op != "add":
+            return
+        sender_id = ev.get("user_id")
+        if sender_id is None and isinstance(ev.get("user"), dict):
+            sender_id = ev["user"].get("user_id") or ev["user"].get("id")
+        my_id = self._me.get("user_id")
+        if sender_id is not None and my_id is not None and int(sender_id) == int(my_id):
+            return  # self-reaction echo
+
+        msg_id = ev.get("message_id")
+        emoji_name = ev.get("emoji_name") or "?"
+        if msg_id is None or self._client is None:
+            return
+
+        # Look up the target message to recover stream/topic + author.
+        try:
+            target = await self._client.get_message(int(msg_id))
+        except Exception:
+            logger.warning("[zulip] reaction: could not fetch message %s", msg_id)
+            return
+
+        target_author = target.get("sender_id")
+        if my_id is None or target_author != my_id:
+            # User reacted to someone else's message — out of scope for the
+            # agent's session. Log and skip.
+            logger.debug(
+                "[zulip] reaction :%s: from user=%s on msg=%s (author=%s, not me) — ignored",
+                emoji_name, sender_id, msg_id, target_author,
+            )
+            return
+
+        # Route into the same session the bot's original reply belonged to.
+        msg_type = target.get("type", "stream")
+        if msg_type == "stream":
+            stream_name = target.get("display_recipient") or ""
+            topic = (target.get("subject") or "").strip() or DEFAULT_TOPIC
+            chat_id = f"stream:{stream_name}"
+            parent_chat_id = chat_id
+            thread_id = topic
+            chat_name = f"#{stream_name}"
+            chat_type = "channel"
+        else:
+            recipients = target.get("display_recipient") or []
+            user_ids = sorted({int(r["id"]) for r in recipients if "id" in r}) if isinstance(recipients, list) else []
+            if my_id is not None and int(my_id) not in user_ids:
+                user_ids = sorted(user_ids + [int(my_id)])
+            chat_id = "dm:" + ",".join(str(u) for u in user_ids)
+            parent_chat_id = None
+            thread_id = None
+            chat_name = "Zulip DM"
+            chat_type = "dm"
+
+        user_info = ev.get("user") or {}
+        user_name = (
+            user_info.get("full_name")
+            or user_info.get("email")
+            or f"user:{sender_id}"
+        )
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            user_id=str(sender_id) if sender_id is not None else "",
+            user_name=user_name,
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+            message_id=f"reaction:{msg_id}:{emoji_name}",
+        )
+
+        synthetic_text = f"[{user_name} reacted :{emoji_name}: to your message #{msg_id}]"
+        event = MessageEvent(
+            text=synthetic_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"reaction_event": ev, "target_message": target},
+            message_id=f"reaction:{msg_id}:{emoji_name}",
+        )
+        logger.info(
+            "[zulip] reaction :%s: from %s on bot msg %s — dispatched to session",
+            emoji_name, user_name, msg_id,
         )
         await self.handle_message(event)
 
