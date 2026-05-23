@@ -21,7 +21,7 @@ import asyncio
 import logging
 import os
 import random
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -343,21 +343,30 @@ class ZulipAdapter(BasePlatformAdapter):
     async def send(
         self,
         chat_id: str,
-        text: str,
+        content: str = "",
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         *,
+        text: Optional[str] = None,
         thread_id: Optional[str] = None,
         **_kwargs: Any,
     ) -> SendResult:
+        # Accept both the gateway's standard (chat_id, content, reply_to, metadata)
+        # signature and the legacy (chat_id, text=, thread_id=) keyword form used
+        # by smoke tests / standalone scripts.
+        body = text if text is not None else content
+        if thread_id is None and metadata:
+            thread_id = metadata.get("thread_id") or metadata.get("topic")
         if not self._client:
             return SendResult(success=False, error="zulip: not connected")
         kind, val = _parse_chat_id(chat_id)
         try:
             if kind == "stream":
                 topic = thread_id or DEFAULT_TOPIC
-                msg_id = await self._client.send_stream_message(val, topic, text)
+                msg_id = await self._client.send_stream_message(val, topic, body)
             else:  # dm
                 recipients = [e.strip() for e in val.split(",") if e.strip()]
-                msg_id = await self._client.send_direct_message(recipients, text)
+                msg_id = await self._client.send_direct_message(recipients, body)
             return SendResult(success=True, message_id=str(msg_id))
         except ZulipAPIError as e:
             logger.error("[zulip] send failed: %s", e)
