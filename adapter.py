@@ -967,44 +967,113 @@ async def _standalone_send(
     pconfig: PlatformConfig,
     chat_id: str,
     message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[list] = None,
+    force_document: bool = False,
     **_kwargs: Any,
 ) -> dict:
-    """Out-of-process send for cron jobs that don't have a live adapter."""
+    """Out-of-process send for cron jobs (and the ``send_message`` agent tool
+    when no live gateway adapter is registered for this process).
+
+    The gateway invokes us with the keyword args defined in
+    ``tools/send_message_tool.py`` — ``thread_id`` (topic), ``media_files``
+    (list of local paths), and ``force_document`` (don't auto-promote images
+    to inline preview). We honour all three.
+
+    Topic resolution order:
+      1. Explicit ``thread_id`` kwarg (preferred — this is what cron passes).
+      2. Trailing ``:<topic>`` segment in ``chat_id`` (legacy / smoke tests).
+      3. ``DEFAULT_TOPIC``.
+
+    ``chat_id`` formats accepted (matches the live adapter)::
+
+        "stream:<name>"          → stream message, topic from thread_id
+        "stream:<name>:<topic>"  → legacy; thread_id wins if provided
+        "<name>"                 → lenient; treated as stream
+        "dm:<email1>,<email2>"   → direct / group DM
+    """
     extra = pconfig.extra or {}
     site = extra.get("site") or os.getenv("ZULIP_SITE", "")
     email = extra.get("email") or os.getenv("ZULIP_EMAIL", "")
     key = extra.get("api_key") or pconfig.token or os.getenv("ZULIP_API_KEY", "")
     verify_tls = _truthy(extra.get("verify_tls", os.getenv("ZULIP_VERIFY_TLS", "true")))
+    tag_outgoing = _truthy(
+        extra.get("tag_outgoing_ids", os.getenv("ZULIP_TAG_OUTGOING_IDS", "true"))
+    )
     if not (site and email and key):
         return {"success": False, "error": "zulip: missing credentials"}
 
-    # chat_id formats accepted:
-    #   "stream:<name>:<topic>"
-    #   "stream:<name>"   (uses DEFAULT_TOPIC)
-    #   "<name>:<topic>"  (lenient — assumes stream)
-    #   "dm:a@x.com,b@y.com"
     parts = chat_id.split(":")
-    if parts[0] == "dm" and len(parts) >= 2:
+    is_dm = parts[0] == "dm" and len(parts) >= 2
+    if is_dm:
         recipients = [p.strip() for p in parts[1].split(",") if p.strip()]
-        async with ZulipClient(site, email, key, verify_tls=verify_tls) as c:
-            mid = await c.send_direct_message(recipients, message)
-        return {"success": True, "message_id": str(mid)}
-    if parts[0] == "stream":
-        stream = parts[1] if len(parts) > 1 else ""
-        topic = parts[2] if len(parts) > 2 else DEFAULT_TOPIC
-    elif len(parts) == 2:
-        stream, topic = parts[0], parts[1]
+        stream = None
+        topic = None
     else:
-        stream, topic = parts[0], DEFAULT_TOPIC
-
-    if not stream:
-        return {"success": False, "error": "zulip: empty stream in chat_id"}
+        if parts[0] == "stream":
+            stream = parts[1] if len(parts) > 1 else ""
+            legacy_topic = parts[2] if len(parts) > 2 else None
+        elif len(parts) == 2:
+            stream, legacy_topic = parts[0], parts[1]
+        else:
+            stream, legacy_topic = parts[0], None
+        topic = (thread_id or legacy_topic or DEFAULT_TOPIC).strip() or DEFAULT_TOPIC
+        if not stream:
+            return {"success": False, "error": "zulip: empty stream in chat_id"}
 
     try:
         async with ZulipClient(site, email, key, verify_tls=verify_tls) as c:
-            mid = await c.send_stream_message(stream, topic, message)
+            # ---- media upload (if any) --------------------------------
+            body = message or ""
+            uploaded_uris: list[tuple[str, str]] = []  # (filename, uri)
+            for path_str in (media_files or []):
+                p = Path(path_str).expanduser()
+                if not p.exists():
+                    logger.warning("[zulip] standalone: media file not found: %s", p)
+                    continue
+                try:
+                    mime, _ = mimetypes.guess_type(p.name)
+                    data = p.read_bytes()
+                    uri = await c.upload_file(p.name, data, mime or "application/octet-stream")
+                    uploaded_uris.append((p.name, uri))
+                except Exception as e:
+                    logger.warning("[zulip] standalone: upload failed for %s: %s", p, e)
+
+            if uploaded_uris:
+                # Always render as Zulip attachment markdown. Inline preview
+                # is auto-decided by Zulip from MIME — force_document only
+                # matters on platforms that distinguish inline-photo vs
+                # file-attachment delivery; on Zulip both render the same.
+                links = "\n".join(f"[{name}]({uri})" for name, uri in uploaded_uris)
+                body = f"{body}\n\n{links}" if body else links
+
+            # ---- send --------------------------------------------------
+            if is_dm:
+                mid = await c.send_direct_message(recipients, body)
+            else:
+                mid = await c.send_stream_message(stream, topic, body)
+
+            # ---- [msg #N] auto-tag (mirrors live adapter) -------------
+            if (
+                tag_outgoing
+                and body
+                and not body.lstrip().startswith("[msg #")
+            ):
+                tagged = f"[msg #{mid}] {body}"
+                try:
+                    await c.update_message(int(mid), content=tagged)
+                except Exception:
+                    logger.debug(
+                        "[zulip] standalone: tag failed for msg=%s",
+                        mid, exc_info=True,
+                    )
+
         return {"success": True, "message_id": str(mid)}
     except ZulipAPIError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.exception("[zulip] standalone send crashed")
         return {"success": False, "error": str(e)}
 
 

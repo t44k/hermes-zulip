@@ -35,7 +35,7 @@ auto-creates topics on first message.
 | M4 | Outbound tools (`zulip_post`, `zulip_list_streams`, etc.) | ✅ |
 | M5 | Image upload + inbound media | ✅ |
 | M6 | Reactions (in + out) | ✅ |
-| M7 | Cron delivery / standalone sender | scaffold present |
+| M7 | Cron delivery / standalone sender | ✅ thread_id + media + auto-tag |
 | M8 | Message editing + delete + polish | … |
 
 ## Install

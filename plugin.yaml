@@ -55,3 +55,8 @@ optional_env:
     description: "Verify TLS certs on the realm (default true — set false for self-signed dev realms)"
     prompt: "Verify TLS? (true/false)"
     password: false
+
+  - name: ZULIP_TAG_OUTGOING_IDS
+    description: "If true, auto-prepend '[msg #N] ' to every outbound message so the bot can identify its own posts when scrolling history (default: true)"
+    prompt: "Auto-tag outbound message IDs? (true/false)"
+    password: false

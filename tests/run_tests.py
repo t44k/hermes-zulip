@@ -1230,6 +1230,154 @@ def run_m9() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M7 tests: standalone sender (cron + send_message fallback)
+# --------------------------------------------------------------------------- #
+
+def run_m7() -> int:
+    """M7 — _standalone_send: thread_id, media_files, tagging, chat_id formats."""
+    import asyncio
+    import tempfile
+    from unittest.mock import AsyncMock, patch
+    from gateway.config import PlatformConfig
+    from hermes_plugins.zulip.adapter import _standalone_send
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM7: standalone sender")
+
+    pcfg = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+    })
+
+    def _mk_fake_client(send_id: int = 5001):
+        fc = AsyncMock()
+        fc.__aenter__ = AsyncMock(return_value=fc)
+        fc.__aexit__ = AsyncMock(return_value=None)
+        fc.send_stream_message = AsyncMock(return_value=send_id)
+        fc.send_direct_message = AsyncMock(return_value=send_id)
+        fc.update_message = AsyncMock(return_value={"result": "success"})
+        fc.upload_file = AsyncMock(return_value="/user_uploads/2/ab/cd/x.png")
+        return fc
+
+    # 1) thread_id kwarg wins over chat_id legacy topic
+    fc = _mk_fake_client()
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        r = asyncio.run(_standalone_send(
+            pcfg, "stream:sandbox:legacy-topic", "hello",
+            thread_id="cron-results",
+        ))
+    _check("send success", r["success"] and r["message_id"] == "5001")
+    fc.send_stream_message.assert_awaited_with("sandbox", "cron-results", "hello")
+    fc.update_message.assert_awaited_with(5001, content="[msg #5001] hello")
+
+    # 2) legacy chat_id with topic (no thread_id) still works
+    fc = _mk_fake_client(5002)
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        r = asyncio.run(_standalone_send(
+            pcfg, "stream:sandbox:topicX", "msg",
+        ))
+    _check("legacy chat_id topic", r["success"])
+    fc.send_stream_message.assert_awaited_with("sandbox", "topicX", "msg")
+
+    # 3) bare 'stream:name' + no thread_id → DEFAULT_TOPIC
+    fc = _mk_fake_client(5003)
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        r = asyncio.run(_standalone_send(pcfg, "stream:sandbox", "msg"))
+    _check("default topic fallback", r["success"])
+    fc.send_stream_message.assert_awaited_with("sandbox", "(no topic)", "msg")
+
+    # 4) DM path
+    fc = _mk_fake_client(5004)
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        r = asyncio.run(_standalone_send(
+            pcfg, "dm:tamas@359.wtf,other@x.com", "ping",
+        ))
+    _check("dm send success", r["success"])
+    fc.send_direct_message.assert_awaited_with(
+        ["tamas@359.wtf", "other@x.com"], "ping",
+    )
+
+    # 5) Media upload — file attached to body
+    tmpf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmpf.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+    tmpf.close()
+    fc = _mk_fake_client(5005)
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        r = asyncio.run(_standalone_send(
+            pcfg, "stream:sandbox", "caption",
+            thread_id="art", media_files=[tmpf.name],
+        ))
+    _check("media send success", r["success"])
+    _check("upload was called", fc.upload_file.await_count == 1)
+    sent_body = fc.send_stream_message.await_args.args[2]
+    _check("body has caption", "caption" in sent_body)
+    _check("body has attachment link", "/user_uploads/" in sent_body)
+
+    # Missing media file → warning logged, still sends text
+    fc = _mk_fake_client(5006)
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        r = asyncio.run(_standalone_send(
+            pcfg, "stream:sandbox", "no img",
+            thread_id="t", media_files=["/nonexistent/file.png"],
+        ))
+    _check("missing media: still success", r["success"])
+    _check("missing media: no upload", fc.upload_file.await_count == 0)
+
+    # 6) Auto-tag respects extra flag
+    pcfg_no_tag = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+        "tag_outgoing_ids": "false",
+    })
+    fc = _mk_fake_client(5007)
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        asyncio.run(_standalone_send(pcfg_no_tag, "stream:sandbox", "no tag", thread_id="t"))
+    _check("tag flag off → no update_message",
+           fc.update_message.await_count == 0)
+
+    # 7) Pre-tagged body skips re-tag
+    fc = _mk_fake_client(5008)
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        asyncio.run(_standalone_send(
+            pcfg, "stream:sandbox", "[msg #99] already tagged", thread_id="t",
+        ))
+    _check("pre-tagged body skips re-tag",
+           fc.update_message.await_count == 0)
+
+    # 8) Missing credentials → error
+    pcfg_bare = PlatformConfig(enabled=True, extra={})
+    # Need to make sure env vars are not set — _standalone_send falls back to env
+    import os as _os
+    saved = {k: _os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
+    try:
+        r = asyncio.run(_standalone_send(pcfg_bare, "stream:sandbox", "x"))
+        _check("missing creds → error", not r["success"] and "credentials" in r["error"])
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                _os.environ[k] = v
+
+    # 9) Empty stream → error
+    r = asyncio.run(_standalone_send(pcfg, "stream:", "x", thread_id="t"))
+    _check("empty stream → error", not r["success"])
+
+    # 10) ZulipAPIError propagates as failure dict
+    from hermes_plugins.zulip.client import ZulipAPIError
+    fc = _mk_fake_client(5010)
+    fc.send_stream_message.side_effect = ZulipAPIError(400, "BAD_REQUEST", "no such stream")
+    with patch("hermes_plugins.zulip.adapter.ZulipClient", return_value=fc):
+        r = asyncio.run(_standalone_send(pcfg, "stream:nope", "x", thread_id="t"))
+    _check("api error → success=False", not r["success"])
+    _check("api error message preserved", "no such stream" in r["error"])
+
+    print(f"\nM7 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
@@ -1239,4 +1387,5 @@ if __name__ == "__main__":
     rc6 = run_m6_polish()
     rc7 = run_m8()
     rc8 = run_m9()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8)
+    rc9 = run_m7()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8 | rc9)
