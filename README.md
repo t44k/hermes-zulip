@@ -133,7 +133,7 @@ matching `ZULIP_*` env var.
 | `ZULIP_TRIGGER_MODE`        | `all`       | `all` = reply to every non-self message in subscribed streams. `mention_only` = only stream messages that `@`-mention the bot (or DMs). |
 | `ZULIP_AUTO_SEEN_REACTION`  | `true`      | Add `:eyes:` to every inbound message, remove on successful turn completion. Leave in place on error/crash. |
 | `ZULIP_SEEN_EMOJI`          | `eyes`      | Short-name for the seen-reaction. Try `mag`, `see_no_evil`, or `sparkles`. |
-| `ZULIP_TAG_OUTGOING_IDS`    | `true`      | Auto-prepend `[msg #N] ` to every outbound message so the agent can identify its own posts when scrolling history via `zulip_fetch`. |
+| `ZULIP_TAG_OUTGOING_IDS`    | `false`     | If `true`, auto-prepend `[msg #N] ` to every outbound message via a follow-up PATCH so the bot can identify its own posts when scrolling history. Off by default — visible in-channel noise outweighs the convenience, since `zulip_fetch` already returns sender + id per message. |
 
 ---
 
@@ -287,8 +287,11 @@ lingering eye is intentional — it's a signal that the turn didn't
 complete. Set `ZULIP_AUTO_SEEN_REACTION=false` to disable.
 
 **Outbound messages have `[msg #N]` prefix and you don't want it.**
-Set `ZULIP_TAG_OUTGOING_IDS=false`. The agent can still identify its
-own past posts by sender name when calling `zulip_fetch`.
+That feature is **off by default** as of v0.2 — if you're seeing the prefix
+you either set `ZULIP_TAG_OUTGOING_IDS=true` somewhere or upgraded from an
+earlier build. Unset the env var (or set it to `false`) and restart the
+gateway. The agent identifies its own past posts via sender name + `id`
+returned by `zulip_fetch`.
 
 ---
 

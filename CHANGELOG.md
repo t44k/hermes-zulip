@@ -3,6 +3,20 @@
 All notable changes to **hermes-zulip** are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING (default behaviour, not API):** `ZULIP_TAG_OUTGOING_IDS`
+  defaults to **`false`** (was `true`). The auto-prepended `[msg #N]`
+  prefix on every outbound message was visible noise for human readers
+  in the channel, while the agent can already identify its own past
+  posts via sender name + `id` returned by `zulip_fetch`. Users who
+  relied on the prefix can opt back in with `ZULIP_TAG_OUTGOING_IDS=true`.
+  Platform-hint string updated to drop the "your outbound messages are
+  auto-tagged" sentence. Regression test added so the default can't
+  silently flip back.
+
 ## [0.1.0] — 2026-05-23
 
 First releasable cut — feature-complete for a single-user Hermes ↔ Zulip

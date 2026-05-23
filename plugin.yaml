@@ -57,7 +57,7 @@ optional_env:
     password: false
 
   - name: ZULIP_TAG_OUTGOING_IDS
-    description: "If true, auto-prepend '[msg #N] ' to every outbound message so the bot can identify its own posts when scrolling history (default: true)"
+    description: "If true, auto-prepend '[msg #N] ' to every outbound message so the bot can identify its own posts when scrolling history. Off by default — visible noise outweighs the convenience (default: false)"
     prompt: "Auto-tag outbound message IDs? (true/false)"
     password: false
 

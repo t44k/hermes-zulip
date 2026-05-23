@@ -1135,6 +1135,9 @@ def run_m9() -> int:
         "site": "https://zulip.example.com",
         "email": "ange-bot@example.com",
         "api_key": "k",
+        # M9 originally defaulted ON; flag is opt-in as of v0.2.
+        # Keep the rest of this block exercising the ON path.
+        "tag_outgoing_ids": "true",
     })
     a = ZulipAdapter(cfg)
     a._me = {"user_id": 11, "email": "ange-bot@example.com"}
@@ -1179,6 +1182,35 @@ def run_m9() -> int:
     _check("PATCH failure swallowed; send succeeds",
            r.success and r.message_id == "12345")
     a._client.update_message.side_effect = None
+
+    # --- v0.2: outbound auto-tag is OFF by default ---------------------- #
+    # Regression: constructing an adapter without the flag set must NOT
+    # tag outbound messages. Visible-in-channel noise vs. the agent's
+    # ability to identify its own posts via sender name + zulip_fetch.
+    saved_env = {k: _os.environ.pop(k, None) for k in ("ZULIP_TAG_OUTGOING_IDS",)}
+    try:
+        default_cfg = PlatformConfig(enabled=True, extra={
+            "site": "https://zulip.example.com",
+            "email": "ange-bot@example.com",
+            "api_key": "k",
+            # No tag_outgoing_ids key — pick up env/built-in default.
+        })
+        default_a = ZulipAdapter(default_cfg)
+        _check("default tag_outgoing_ids is FALSE",
+               default_a.tag_outgoing_ids is False)
+
+        # And exercise the send path to confirm no PATCH fires.
+        default_a._me = {"user_id": 11, "email": "ange-bot@example.com"}
+        default_a._client = AsyncMock()
+        default_a._client.send_stream_message = AsyncMock(return_value=22222)
+        default_a._client.update_message = AsyncMock(return_value={"result": "success"})
+        asyncio.run(default_a.send("stream:sandbox", "no tag by default", thread_id="t"))
+        _check("default send → no [msg #N] PATCH",
+               default_a._client.update_message.await_count == 0)
+    finally:
+        for k, v in saved_env.items():
+            if v is not None:
+                _os.environ[k] = v
 
     # 6) Regression: cron-style 3-segment chat_id `stream:foo:topic`
     #    must route to stream=foo, topic=topic (not stream='foo:topic').
@@ -1312,6 +1344,8 @@ def run_m7() -> int:
         "site": "https://zulip.example.com",
         "email": "ange-bot@example.com",
         "api_key": "k",
+        # Outbound auto-tag is opt-in as of v0.2; M7 happy-path tests the ON path.
+        "tag_outgoing_ids": "true",
     })
 
     def _mk_fake_client(send_id: int = 5001):
@@ -1460,6 +1494,8 @@ def run_m10() -> int:
         "site": "https://zulip.example.com",
         "email": "ange-bot@example.com",
         "api_key": "k",
+        # Outbound auto-tag is opt-in as of v0.2; this block tests the ON path.
+        "tag_outgoing_ids": "true",
     })
     a = ZulipAdapter(cfg)
     a._me = {"user_id": 11, "email": "ange-bot@example.com"}

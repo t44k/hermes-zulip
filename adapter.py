@@ -86,9 +86,8 @@ PLATFORM_HINT = (
     "is the Zulip message_id, the only reliable way to target the message "
     "for reactions, edits, or quoted replies. Use it; do NOT guess IDs. "
     "Strip the `[msg #N]` prefix from the user's text before reasoning about "
-    "the content. Your own outbound messages are also auto-tagged with "
-    "`[msg #N]` after sending, so when you scroll back via `zulip_fetch` you "
-    "can identify your own past posts. "
+    "the content. When you scroll back via `zulip_fetch`, your own past posts "
+    "are identifiable by sender name and carry their `id` in the response. "
     "To read the conversation history of a topic or DM (e.g. to summarise, "
     "quote, edit, or delete an earlier message you don't see in this turn), "
     "call `zulip_fetch(stream=..., topic=..., num_before=N)` or "
@@ -194,7 +193,7 @@ class ZulipAdapter(BasePlatformAdapter):
         # the inbound prefix). Single extra round-trip; self-edit event
         # is filtered upstream so this doesn't cause feedback loops.
         self.tag_outgoing_ids: bool = _truthy(
-            extra.get("tag_outgoing_ids", os.getenv("ZULIP_TAG_OUTGOING_IDS", "true"))
+            extra.get("tag_outgoing_ids", os.getenv("ZULIP_TAG_OUTGOING_IDS", "false"))
         )
         # ---- M12: trigger mode ----
         # "all"          — dispatch every non-self message (default; matches
@@ -1140,7 +1139,7 @@ async def _standalone_send(
     key = extra.get("api_key") or pconfig.token or os.getenv("ZULIP_API_KEY", "")
     verify_tls = _truthy(extra.get("verify_tls", os.getenv("ZULIP_VERIFY_TLS", "true")))
     tag_outgoing = _truthy(
-        extra.get("tag_outgoing_ids", os.getenv("ZULIP_TAG_OUTGOING_IDS", "true"))
+        extra.get("tag_outgoing_ids", os.getenv("ZULIP_TAG_OUTGOING_IDS", "false"))
     )
     if not (site and email and key):
         return {"success": False, "error": "zulip: missing credentials"}
