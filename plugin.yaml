@@ -60,3 +60,8 @@ optional_env:
     description: "If true, auto-prepend '[msg #N] ' to every outbound message so the bot can identify its own posts when scrolling history (default: true)"
     prompt: "Auto-tag outbound message IDs? (true/false)"
     password: false
+
+  - name: ZULIP_TRIGGER_MODE
+    description: "When to dispatch messages to the agent: 'all' = every message (default, good for single-user homelab), 'mention_only' = only when @-mentioned or DM'd (good for shared streams)"
+    prompt: "Trigger mode (all | mention_only)"
+    password: false

@@ -39,6 +39,8 @@ auto-creates topics on first message.
 | M8 | Message editing + delete + polish | ✅ |
 | M9 | History fetch + outgoing ID auto-tag | ✅ |
 | M10 | Streaming responses (in-place edits) | ✅ |
+| M11 | Test cleanup + GitHub Actions CI | ✅ |
+| M12 | Configurable trigger mode (all / mention_only) | ✅ |
 
 ## Install
 

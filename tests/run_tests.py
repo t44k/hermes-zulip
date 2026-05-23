@@ -1527,6 +1527,146 @@ def run_m10() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M12 tests: configurable trigger mode (all | mention_only)
+# --------------------------------------------------------------------------- #
+
+def run_m12() -> int:
+    """M12 — trigger_mode='all' (default) vs 'mention_only' with @-detection."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from gateway.config import PlatformConfig
+    from hermes_plugins.zulip.adapter import ZulipAdapter
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM12: trigger_mode config + parsing")
+
+    # ---- config parsing ----
+    base = {"site": "s", "email": "e", "api_key": "k"}
+    a_default = ZulipAdapter(PlatformConfig(enabled=True, extra=dict(base)))
+    _check("default trigger_mode == 'all'", a_default.trigger_mode == "all")
+
+    a_mention = ZulipAdapter(PlatformConfig(enabled=True, extra=dict(base, trigger_mode="mention_only")))
+    _check("explicit trigger_mode='mention_only'",
+           a_mention.trigger_mode == "mention_only")
+
+    # Case-insensitive + whitespace
+    a_caps = ZulipAdapter(PlatformConfig(enabled=True, extra=dict(base, trigger_mode="  MENTION_ONLY  ")))
+    _check("uppercase/whitespace normalised", a_caps.trigger_mode == "mention_only")
+
+    # Bogus value → falls back to 'all'
+    a_bogus = ZulipAdapter(PlatformConfig(enabled=True, extra=dict(base, trigger_mode="weird")))
+    _check("invalid mode falls back to 'all'", a_bogus.trigger_mode == "all")
+
+    # ---- _is_addressed_to_bot helper ----
+    print("\nM12: _is_addressed_to_bot helper")
+    a = ZulipAdapter(PlatformConfig(enabled=True, extra=dict(base, trigger_mode="mention_only")))
+    a._me = {"user_id": 11, "email": "ange-bot@example.com", "full_name": "Ange"}
+
+    # mention flag (most common case)
+    _check("flag 'mentioned' → True",
+           a._is_addressed_to_bot({"flags": ["read", "mentioned"], "content": "hey"}))
+    _check("flag 'wildcard_mentioned' → True",
+           a._is_addressed_to_bot({"flags": ["wildcard_mentioned"], "content": "@everyone"}))
+    _check("flag 'topic_wildcard_mentioned' → True",
+           a._is_addressed_to_bot({"flags": ["topic_wildcard_mentioned"], "content": "@topic"}))
+    _check("flag 'stream_wildcard_mentioned' → True",
+           a._is_addressed_to_bot({"flags": ["stream_wildcard_mentioned"], "content": "@stream"}))
+
+    # No flag, but content has @**Ange**
+    _check("content @**Ange** → True",
+           a._is_addressed_to_bot({"flags": ["read"], "content": "yo @**Ange** look"}))
+    _check("content @_**Ange** silent mention → True",
+           a._is_addressed_to_bot({"flags": [], "content": "fyi @_**Ange**"}))
+
+    # No flag, no mention → False
+    _check("plain stream chatter → False",
+           not a._is_addressed_to_bot({"flags": ["read"], "content": "random talk"}))
+
+    # Email match via rendered_content
+    _check("rendered content data-user-email match → True",
+           a._is_addressed_to_bot({
+               "flags": [],
+               "content": "",
+               "rendered_content": '<p>hi <span class="user-mention" data-user-email="ange-bot@example.com">@Ange</span></p>',
+           }))
+
+    # No flags AND name happens to appear in plain text (no @-prefix) → False
+    _check("bare name without @-prefix → False",
+           not a._is_addressed_to_bot({"flags": [], "content": "I told Ange yesterday"}))
+
+    # ---- dispatch gate ----
+    print("\nM12: dispatch gate (mention_only mode)")
+    a.handle_message = AsyncMock()
+    a._client = AsyncMock()  # adapter requires a client to dispatch
+
+    def _stream_msg(content="hi", flags=None, mid=42):
+        return {
+            "id": mid, "sender_id": 8, "sender_full_name": "Tamas",
+            "type": "stream", "display_recipient": "sandbox",
+            "subject": "general", "content": content,
+            "flags": flags or ["read"],
+        }
+
+    # 1) Unmentioned stream message → dropped
+    a.handle_message.reset_mock()
+    asyncio.run(a._handle_message_event(_stream_msg(content="just chatting")))
+    _check("mention_only drops unaddressed stream msg",
+           a.handle_message.await_count == 0)
+
+    # 2) Mentioned stream message → dispatched
+    a.handle_message.reset_mock()
+    asyncio.run(a._handle_message_event(_stream_msg(
+        content="@**Ange** halp", flags=["read", "mentioned"],
+    )))
+    _check("mention_only dispatches @-mentioned msg",
+           a.handle_message.await_count == 1)
+
+    # 3) DM always passes regardless of mention_only
+    a.handle_message.reset_mock()
+    dm = {
+        "id": 51, "sender_id": 8, "sender_full_name": "Tamas",
+        "type": "private", "display_recipient": [
+            {"id": 11, "email": "ange-bot@example.com"},
+            {"id": 8, "email": "tamas@359.wtf"},
+        ],
+        "content": "no mention but DM", "flags": ["read"],
+    }
+    asyncio.run(a._handle_message_event(dm))
+    _check("mention_only always dispatches DMs",
+           a.handle_message.await_count == 1)
+
+    # 4) Bot's own message still filtered (self-filter before mention gate)
+    a.handle_message.reset_mock()
+    own = _stream_msg(content="@**Ange** echo", flags=["read", "mentioned"])
+    own["sender_id"] = 11  # bot's own id
+    asyncio.run(a._handle_message_event(own))
+    _check("self-filter still wins over mention gate",
+           a.handle_message.await_count == 0)
+
+    # ---- default 'all' mode passes everything ----
+    print("\nM12: dispatch gate ('all' mode = default)")
+    a_all = ZulipAdapter(PlatformConfig(enabled=True, extra=dict(base)))
+    a_all._me = {"user_id": 11, "email": "ange-bot@example.com", "full_name": "Ange"}
+    a_all._client = AsyncMock()
+    a_all.handle_message = AsyncMock()
+
+    asyncio.run(a_all._handle_message_event(_stream_msg(content="random")))
+    _check("all-mode dispatches unaddressed",
+           a_all.handle_message.await_count == 1)
+
+    a_all.handle_message.reset_mock()
+    asyncio.run(a_all._handle_message_event(_stream_msg(
+        content="@**Ange** hi", flags=["mentioned"],
+    )))
+    _check("all-mode dispatches mentioned too",
+           a_all.handle_message.await_count == 1)
+
+    print(f"\nM12 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
@@ -1538,4 +1678,5 @@ if __name__ == "__main__":
     rc8 = run_m9()
     rc9 = run_m7()
     rc10 = run_m10()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8 | rc9 | rc10)
+    rc11 = run_m12()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8 | rc9 | rc10 | rc11)

@@ -196,6 +196,23 @@ class ZulipAdapter(BasePlatformAdapter):
         self.tag_outgoing_ids: bool = _truthy(
             extra.get("tag_outgoing_ids", os.getenv("ZULIP_TAG_OUTGOING_IDS", "true"))
         )
+        # ---- M12: trigger mode ----
+        # "all"          — dispatch every non-self message (default; matches
+        #                  legacy behaviour, useful for a single-user homelab
+        #                  bot in a quiet stream)
+        # "mention_only" — only dispatch when the bot was @-mentioned (direct
+        #                  or wildcard) OR the message is a DM. Anything else
+        #                  is silently dropped (the bot still receives the
+        #                  event, it just doesn't open an agent turn).
+        _mode = (
+            extra.get("trigger_mode") or os.getenv("ZULIP_TRIGGER_MODE", "all")
+        ).strip().lower()
+        if _mode not in ("all", "mention_only"):
+            logger.warning(
+                "[zulip] unknown trigger_mode %r — falling back to 'all'", _mode,
+            )
+            _mode = "all"
+        self.trigger_mode: str = _mode
 
         self._client: Optional[ZulipClient] = None
         self._me: dict = {}
@@ -357,6 +374,49 @@ class ZulipAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+    def _is_addressed_to_bot(self, m: dict) -> bool:
+        """Return True iff this stream message addresses the bot directly.
+
+        Zulip's event payload carries ``flags`` on a per-recipient basis when
+        a user mentions another user. For the bot's own event queue we'll
+        see:
+          * ``"mentioned"``           — direct @-mention (``@**Ange**``)
+          * ``"wildcard_mentioned"``  — ``@**all**`` / ``@**stream**`` /
+                                        ``@**channel**`` / ``@**topic**``
+          * ``"topic_wildcard_mentioned"`` — newer topic-wildcard mention
+
+        We accept any of those as 'addressed to bot'. As a defensive
+        fallback (some Zulip versions / queue configs omit flags), we also
+        scan the rendered/source content for our own mention tokens.
+        """
+        flags = m.get("flags") or []
+        mention_flags = {
+            "mentioned",
+            "wildcard_mentioned",
+            "topic_wildcard_mentioned",
+            "stream_wildcard_mentioned",
+        }
+        if any(f in mention_flags for f in flags):
+            return True
+
+        # Defensive content scan — match our bot's full name or email.
+        # Zulip renders @-mentions as `@**Display Name**` (with optional
+        # `_` prefix for silent mentions) in source markdown, or as an
+        # HTML span in rendered content. We check both.
+        content = (m.get("content") or "") + " " + (m.get("rendered_content") or "")
+        my_name = (self._me.get("full_name") or "").strip()
+        my_email = (self._me.get("email") or "").strip()
+        if my_name:
+            # `@**Name**`, `@_**Name**`, and Markdown without surrounding **
+            if (
+                f"@**{my_name}**" in content
+                or f"@_**{my_name}**" in content
+            ):
+                return True
+        if my_email and f'data-user-email="{my_email}"' in content:
+            return True
+        return False
+
     async def _handle_message_event(self, m: dict) -> None:
         """Dispatch one Zulip message to Hermes via self.handle_message()."""
         sender_id = m.get("sender_id")
@@ -365,6 +425,19 @@ class ZulipAdapter(BasePlatformAdapter):
             return  # self-filter
 
         msg_type = m.get("type", "stream")
+
+        # ---- M12: trigger gate ------------------------------------------
+        # In "mention_only" mode, drop stream messages that don't @-mention
+        # the bot (direct or wildcard). DMs always pass — they're inherently
+        # addressed to the bot.
+        if self.trigger_mode == "mention_only" and msg_type == "stream":
+            if not self._is_addressed_to_bot(m):
+                logger.debug(
+                    "[zulip] mention_only: skipping unaddressed msg %s in #%s",
+                    m.get("id"), m.get("display_recipient"),
+                )
+                return
+
         if msg_type == "stream":
             stream_name = m.get("display_recipient") or ""
             topic = (m.get("subject") or "").strip() or DEFAULT_TOPIC
