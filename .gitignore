@@ -1,10 +1,35 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+build/
+dist/
+
+# Virtualenvs
 .env
 .venv/
 venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / dumps
+*.log
+logs/
+
+# Test artefacts
+.coverage
+htmlcov/
+coverage.xml
