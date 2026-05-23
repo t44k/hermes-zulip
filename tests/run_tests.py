@@ -289,7 +289,132 @@ def run_m2() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M4 tests: agent-facing tools
+# --------------------------------------------------------------------------- #
+
+def run_m4() -> int:
+    import asyncio
+    import os
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    print("\nM4: agent-facing tools")
+
+    from hermes_plugins.zulip import tools as zt
+
+    # Without env vars → tools should refuse cleanly
+    saved = {k: os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
+    try:
+        r = asyncio.run(zt._handle_zulip_post("s", "t", "hi"))
+        _check("post without env → error", r["success"] is False)
+        _check("post error mentions env vars", "ZULIP_SITE" in r["error"])
+        _check("check_zulip_available() False",
+               zt._check_zulip_available() is False)
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    # With env vars set
+    os.environ["ZULIP_SITE"] = "https://example.zulip.com"
+    os.environ["ZULIP_EMAIL"] = "ange-bot@example.com"
+    os.environ["ZULIP_API_KEY"] = "k"
+
+    _check("check_zulip_available() True", zt._check_zulip_available() is True)
+
+    # zulip_post → mock ZulipClient
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.send_stream_message = AsyncMock(return_value=42)
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_post("sandbox", "auth-bug", "hello"))
+    _check("post.success", r["success"] is True)
+    _check("post.message_id == 42", r["message_id"] == 42)
+    _check("post.url has narrow", "/#narrow/stream/sandbox/topic/auth-bug/near/42" in r["url"])
+    fake_client.send_stream_message.assert_awaited_once_with("sandbox", "auth-bug", "hello")
+    _check("client called once", True)
+
+    # zulip_post handles API errors gracefully
+    fake_client.send_stream_message = AsyncMock(
+        side_effect=zt.ZulipAPIError(400, "BAD_REQUEST", "no such stream"),
+    )
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_post("nope", "t", "x"))
+    _check("post bubbles ZulipAPIError", r["success"] is False)
+    _check("post error includes msg", "no such stream" in r["error"])
+
+    # zulip_dm
+    fake_client.send_direct_message = AsyncMock(return_value=7)
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_dm(["tamas@359.wtf"], "hi"))
+    _check("dm.success", r["success"] is True)
+    _check("dm.message_id == 7", r["message_id"] == 7)
+
+    r = asyncio.run(zt._handle_zulip_dm([], "hi"))
+    _check("empty recipients rejected", r["success"] is False)
+
+    # zulip_list_streams
+    fake_client.get_subscriptions = AsyncMock(return_value=[
+        {"name": "sandbox", "stream_id": 7, "description": "Test"},
+        {"name": "engineering", "stream_id": 8, "description": "Eng"},
+    ])
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_list_streams())
+    _check("list_streams count == 2", r["count"] == 2)
+    _check("list_streams names", {s["name"] for s in r["streams"]} == {"sandbox", "engineering"})
+
+    # zulip_list_topics
+    fake_client._request = AsyncMock(return_value={"topics": [
+        {"name": "auth-bug", "max_id": 99},
+        {"name": "future-plans", "max_id": 95},
+    ]})
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_list_topics("sandbox"))
+    _check("list_topics count", r["count"] == 2)
+    _check("list_topics ordering preserved",
+           [t["name"] for t in r["topics"]] == ["auth-bug", "future-plans"])
+
+    # Unknown stream → not subscribed → error
+    fake_client.get_subscriptions = AsyncMock(return_value=[])
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_list_topics("ghost"))
+    _check("list_topics rejects unknown stream", r["success"] is False)
+    _check("list_topics error mentions stream", "ghost" in r["error"])
+
+    # zulip_upload_image — file-not-found path
+    r = asyncio.run(zt._handle_zulip_upload_image("s", "t", "/nope/missing.png"))
+    _check("upload_image rejects missing file", r["success"] is False)
+    _check("upload_image error mentions path", "/nope/missing.png" in r["error"])
+
+    # Tool registration — verify all 5 tools register cleanly
+    registered: list = []
+
+    class _Ctx:
+        def register_tool(self, **kw):
+            registered.append(kw)
+
+    zt.register_tools(_Ctx())
+    _check("registers 5 tools", len(registered) == 5)
+    _check("all in hermes-zulip toolset",
+           {t["toolset"] for t in registered} == {"hermes-zulip"})
+    _check("all async", all(t["is_async"] for t in registered))
+    _check("zulip_post registered",
+           any(t["name"] == "zulip_post" for t in registered))
+    _check("all have requires_env",
+           all("ZULIP_SITE" in t["requires_env"] for t in registered))
+
+    # Hint mentions zulip_post (the magic branching tool)
+    from hermes_plugins.zulip.adapter import PLATFORM_HINT as HINT
+    _check("PLATFORM_HINT names zulip_post", "zulip_post" in HINT)
+    _check("PLATFORM_HINT names zulip_list_topics", "zulip_list_topics" in HINT)
+
+    print(f"\nM4 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
-    sys.exit(rc1 | rc2)
+    rc3 = run_m4()
+    sys.exit(rc1 | rc2 | rc3)

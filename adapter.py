@@ -58,13 +58,15 @@ PLATFORM_HINT = (
     "You are on Zulip, a chat platform organised into **streams** "
     "(project-level channels) and **topics** (threaded conversations inside a stream). "
     "Each topic is its own conversation with its own context — when the user shifts "
-    "to a new subject that doesn't fit the current topic, you may open a new topic "
-    "in the same stream by sending a message to it (topics are auto-created on first "
-    "post). Prefer short kebab-case topic names (≤ 60 chars). "
+    "to a new subject that doesn't fit the current topic, open a new topic in the "
+    "same stream by calling `zulip_post(stream=<current_stream>, topic=<new-name>, "
+    "content=<your message>)`. Topics are auto-created on first post — no setup "
+    "step required. Prefer short kebab-case topic names (≤60 chars). "
+    "When you're unsure which topics already exist, call `zulip_list_topics(stream)`. "
+    "Reply in the existing topic when continuing the same discussion. "
     "Zulip Markdown is supported: **bold**, *italic*, `code`, ```code blocks```, "
     "tables, spoilers (||spoiler||), and @-mentions like @**Tamas**. "
-    "Reply in the existing topic when continuing the same discussion. "
-    "Messages can be edited; long streamed responses will update in place."
+    "Messages can be edited; long streamed responses update in place."
 )
 
 
@@ -560,3 +562,9 @@ def register(ctx) -> None:
         allow_update_command=True,
         platform_hint=PLATFORM_HINT,
     )
+    # M4: agent-facing tools (zulip_post, zulip_list_streams, …)
+    try:
+        from .tools import register_tools
+        register_tools(ctx)
+    except Exception:
+        logger.exception("[zulip] failed to register agent tools (continuing)")
