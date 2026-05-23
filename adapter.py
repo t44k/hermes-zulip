@@ -117,19 +117,29 @@ PLATFORM_HINT = (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _parse_chat_id(chat_id: str) -> tuple[str, str]:
-    """Parse a Hermes chat_id into (kind, value).
+def _parse_chat_id(chat_id: str) -> tuple[str, str, Optional[str]]:
+    """Parse a Hermes chat_id into (kind, value, embedded_topic).
 
     Accepts:
-      ``stream:<name>``     →  ("stream", "<name>")
-      ``dm:<a@x,b@y>``      →  ("dm", "<a@x,b@y>")
-      bare ``<name>``       →  ("stream", "<name>")   (lenient default)
+      ``stream:<name>``              →  ("stream", "<name>", None)
+      ``stream:<name>:<topic>``      →  ("stream", "<name>", "<topic>")
+                                        — used by cron's
+                                        ``--deliver zulip:stream:foo:bar``
+      ``dm:<a@x,b@y>``               →  ("dm", "<a@x,b@y>", None)
+      bare ``<name>``                →  ("stream", "<name>", None)
+                                        (lenient default)
     """
     if ":" in chat_id:
         kind, _, val = chat_id.partition(":")
-        if kind in ("stream", "dm"):
-            return kind, val
-    return "stream", chat_id
+        if kind == "stream":
+            # Allow an embedded topic for cron-style targets.
+            if ":" in val:
+                stream, _, topic = val.partition(":")
+                return "stream", stream, topic or None
+            return "stream", val, None
+        if kind == "dm":
+            return "dm", val, None
+    return "stream", chat_id, None
 
 
 def _truthy(v: Any) -> bool:
@@ -767,7 +777,11 @@ class ZulipAdapter(BasePlatformAdapter):
             thread_id = metadata.get("thread_id") or metadata.get("topic")
         if not self._client:
             return SendResult(success=False, error="zulip: not connected")
-        kind, val = _parse_chat_id(chat_id)
+        kind, val, embedded_topic = _parse_chat_id(chat_id)
+        # Explicit thread_id / metadata.thread_id wins; embedded
+        # `stream:foo:bar` topic is the fallback for cron-style targets.
+        if not thread_id and embedded_topic:
+            thread_id = embedded_topic
         try:
             if kind == "stream":
                 topic = thread_id or DEFAULT_TOPIC
@@ -808,7 +822,9 @@ class ZulipAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return None
-        kind, val = _parse_chat_id(chat_id)
+        kind, val, embedded_topic = _parse_chat_id(chat_id)
+        if not thread_id and embedded_topic:
+            thread_id = embedded_topic
         try:
             if kind == "stream":
                 topic = thread_id or DEFAULT_TOPIC
@@ -886,7 +902,7 @@ class ZulipAdapter(BasePlatformAdapter):
     # ---------- introspection --------------------------------------------
 
     async def get_chat_info(self, chat_id: str) -> dict:
-        kind, val = _parse_chat_id(chat_id)
+        kind, val, _embedded = _parse_chat_id(chat_id)
         if kind == "stream":
             s = self._streams_by_name.get(val) or {}
             return {

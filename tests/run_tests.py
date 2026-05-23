@@ -84,12 +84,14 @@ def run() -> int:
     from gateway.config import PlatformConfig
 
     print("\nchat_id parsing")
-    _check("stream:sandbox", _parse_chat_id("stream:sandbox") == ("stream", "sandbox"))
+    _check("stream:sandbox", _parse_chat_id("stream:sandbox") == ("stream", "sandbox", None))
+    _check("stream:sandbox:topic (cron 3-segment)",
+           _parse_chat_id("stream:sandbox:m7-cron-test") == ("stream", "sandbox", "m7-cron-test"))
     _check("dm:a@x,b@y",
-           _parse_chat_id("dm:a@x.com,b@y.com") == ("dm", "a@x.com,b@y.com"))
-    _check("bare → stream", _parse_chat_id("sandbox") == ("stream", "sandbox"))
+           _parse_chat_id("dm:a@x.com,b@y.com") == ("dm", "a@x.com,b@y.com", None))
+    _check("bare → stream", _parse_chat_id("sandbox") == ("stream", "sandbox", None))
     _check("unknown prefix → stream-whole",
-           _parse_chat_id("weird:thing") == ("stream", "weird:thing"))
+           _parse_chat_id("weird:thing") == ("stream", "weird:thing", None))
 
     print("\ntruthy parser")
     for v in ("1", "true", "TRUE", "Yes", "on", "y"):
@@ -1137,6 +1139,26 @@ def run_m9() -> int:
     _check("PATCH failure swallowed; send succeeds",
            r.success and r.message_id == "12345")
     a._client.update_message.side_effect = None
+
+    # 6) Regression: cron-style 3-segment chat_id `stream:foo:topic`
+    #    must route to stream=foo, topic=topic (not stream='foo:topic').
+    a._client.send_stream_message.reset_mock()
+    a._client.update_message.reset_mock()
+    r = asyncio.run(a.send("stream:sandbox:m7-cron-test", "from cron"))
+    _check("3-segment chat_id success", r.success)
+    a._client.send_stream_message.assert_awaited_with(
+        "sandbox", "m7-cron-test", "from cron",
+    )
+
+    # 7) Explicit thread_id wins over embedded chat_id topic
+    a._client.send_stream_message.reset_mock()
+    r = asyncio.run(a.send(
+        "stream:sandbox:legacy-topic", "msg", thread_id="explicit-topic",
+    ))
+    _check("explicit thread_id beats embedded", r.success)
+    a._client.send_stream_message.assert_awaited_with(
+        "sandbox", "explicit-topic", "msg",
+    )
 
     # ---- zulip_fetch tool ----
     print("\nM9: zulip_fetch tool")
