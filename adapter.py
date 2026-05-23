@@ -815,6 +815,58 @@ class ZulipAdapter(BasePlatformAdapter):
             logger.exception("[zulip] send crashed")
             return SendResult(success=False, error=str(e))
 
+    # M10: streaming-response in-place edits ------------------------------
+    # The gateway's GatewayStreamConsumer drives token-by-token streaming
+    # by calling adapter.edit_message() in a tight loop. The first chunk
+    # goes through normal send(); every subsequent chunk lands here.
+    # We re-apply the [msg #N] prefix on each edit so the tag isn't lost
+    # as the body grows, and we filter out the synthetic update_message
+    # event that Zulip emits for each PATCH (so the agent doesn't see its
+    # own streaming edits as user-edits coming back in).
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        """Edit an existing Zulip message in place.
+
+        Called by GatewayStreamConsumer between deltas during a streamed
+        response, and (with ``finalize=True``) once at the end to commit
+        the final state.
+
+        Re-applies the ``[msg #N]`` auto-tag prefix when enabled so the
+        ID stays visible after every edit.
+        """
+        if not self._client:
+            return SendResult(success=False, error="zulip: not connected")
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return SendResult(success=False, error=f"zulip: invalid message_id {message_id!r}")
+
+        body = content or ""
+        if (
+            self.tag_outgoing_ids
+            and body
+            and not body.lstrip().startswith("[msg #")
+        ):
+            body = f"[msg #{mid}] {body}"
+
+        try:
+            await self._client.update_message(mid, content=body)
+            return SendResult(success=True, message_id=str(mid))
+        except ZulipAPIError as e:
+            logger.debug("[zulip] edit_message failed for mid=%s: %s", mid, e)
+            return SendResult(success=False, error=str(e))
+        except Exception as e:
+            logger.exception("[zulip] edit_message crashed")
+            return SendResult(success=False, error=str(e))
+
     async def send_typing(self, chat_id: str, thread_id: Optional[str] = None) -> None:
         """Show a typing indicator to the user.
 

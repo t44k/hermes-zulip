@@ -1400,6 +1400,116 @@ def run_m7() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M10 tests: streaming-response in-place edits
+# --------------------------------------------------------------------------- #
+
+def run_m10() -> int:
+    """M10 — adapter.edit_message() for GatewayStreamConsumer."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from hermes_plugins.zulip.adapter import ZulipAdapter
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM10: streaming edit_message")
+
+    cfg = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+    })
+    a = ZulipAdapter(cfg)
+    a._me = {"user_id": 11, "email": "ange-bot@example.com"}
+    a._client = AsyncMock()
+    a._client.update_message = AsyncMock(return_value={"result": "success"})
+
+    # 1) Basic edit — re-applies [msg #N] prefix
+    r = asyncio.run(a.edit_message(
+        chat_id="stream:sandbox", message_id="777", content="partial response",
+    ))
+    _check("edit returns SendResult", isinstance(r, SendResult))
+    _check("edit success", r.success and r.message_id == "777")
+    a._client.update_message.assert_awaited_with(
+        777, content="[msg #777] partial response",
+    )
+
+    # 2) Already-tagged body is preserved (no double-prefix)
+    a._client.update_message.reset_mock()
+    asyncio.run(a.edit_message(
+        chat_id="stream:sandbox", message_id="888",
+        content="[msg #888] already there",
+    ))
+    a._client.update_message.assert_awaited_with(
+        888, content="[msg #888] already there",
+    )
+
+    # 3) tag_outgoing_ids disabled — content sent verbatim
+    a.tag_outgoing_ids = False
+    a._client.update_message.reset_mock()
+    asyncio.run(a.edit_message(
+        chat_id="stream:sandbox", message_id="999", content="no prefix here",
+    ))
+    a._client.update_message.assert_awaited_with(
+        999, content="no prefix here",
+    )
+    a.tag_outgoing_ids = True
+
+    # 4) finalize=True and metadata kwargs accepted (signature contract)
+    a._client.update_message.reset_mock()
+    r = asyncio.run(a.edit_message(
+        chat_id="stream:sandbox", message_id="111",
+        content="final", finalize=True, metadata={"thread_id": "t"},
+    ))
+    _check("finalize/metadata accepted", r.success)
+
+    # 5) Invalid message_id → graceful failure (not crash)
+    r = asyncio.run(a.edit_message(
+        chat_id="stream:sandbox", message_id="not-an-int", content="x",
+    ))
+    _check("invalid msg_id → success=False", not r.success and "invalid" in r.error)
+
+    # 6) No client → not-connected error
+    a._client = None
+    r = asyncio.run(a.edit_message(
+        chat_id="stream:sandbox", message_id="1", content="x",
+    ))
+    _check("no client → not connected", not r.success and "not connected" in r.error)
+
+    # 7) ZulipAPIError propagates
+    from hermes_plugins.zulip.client import ZulipAPIError
+    a._client = AsyncMock()
+    a._client.update_message = AsyncMock(
+        side_effect=ZulipAPIError(403, "FORBIDDEN", "can't edit"),
+    )
+    r = asyncio.run(a.edit_message(
+        chat_id="stream:sandbox", message_id="222", content="x",
+    ))
+    _check("api error → success=False", not r.success)
+    _check("api error preserves message", "can't edit" in r.error)
+
+    # 8) Method signature is what GatewayStreamConsumer expects
+    import inspect
+    params = inspect.signature(ZulipAdapter.edit_message).parameters
+    _check("signature: chat_id", "chat_id" in params)
+    _check("signature: message_id", "message_id" in params)
+    _check("signature: content", "content" in params)
+    _check("signature: finalize kwonly",
+           params.get("finalize") is not None
+           and params["finalize"].kind == inspect.Parameter.KEYWORD_ONLY)
+    _check("signature: metadata kwarg",
+           params.get("metadata") is not None)
+
+    # 9) SUPPORTS_MESSAGE_EDITING not set False (default True)
+    _check("SUPPORTS_MESSAGE_EDITING not disabled",
+           getattr(ZulipAdapter, "SUPPORTS_MESSAGE_EDITING", True) is not False)
+
+    print(f"\nM10 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
@@ -1410,4 +1520,5 @@ if __name__ == "__main__":
     rc7 = run_m8()
     rc8 = run_m9()
     rc9 = run_m7()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8 | rc9)
+    rc10 = run_m10()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8 | rc9 | rc10)

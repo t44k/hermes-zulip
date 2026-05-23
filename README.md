@@ -36,7 +36,9 @@ auto-creates topics on first message.
 | M5 | Image upload + inbound media | ✅ |
 | M6 | Reactions (in + out) | ✅ |
 | M7 | Cron delivery / standalone sender | ✅ thread_id + media + auto-tag |
-| M8 | Message editing + delete + polish | … |
+| M8 | Message editing + delete + polish | ✅ |
+| M9 | History fetch + outgoing ID auto-tag | ✅ |
+| M10 | Streaming responses (in-place edits) | ✅ |
 
 ## Install
 
