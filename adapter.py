@@ -17,8 +17,10 @@ Later milestones add: event loop, reactions, uploads, editing, standalone sender
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import random
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,14 @@ from .client import ZulipClient, ZulipAPIError
 PLATFORM_KEY = "zulip"
 MAX_MESSAGE_LENGTH = 10000  # Zulip's documented per-message limit
 DEFAULT_TOPIC = "(no topic)"
+
+# Bad-queue error code returned when our event queue has expired (~10 min idle).
+# We catch this in the event loop and re-register from scratch.
+BAD_EVENT_QUEUE_CODE = "BAD_EVENT_QUEUE_ID"
+
+# Reconnect backoff (seconds). Exponential with jitter, capped.
+_RECONNECT_BACKOFF_MIN = 1.0
+_RECONNECT_BACKOFF_MAX = 60.0
 
 PLATFORM_HINT = (
     "You are on Zulip, a chat platform organised into **streams** "
@@ -112,6 +122,13 @@ class ZulipAdapter(BasePlatformAdapter):
         self._client: Optional[ZulipClient] = None
         self._me: dict = {}
         self._streams_by_name: dict[str, dict] = {}
+        self._streams_by_id: dict[int, dict] = {}
+
+        # Event-queue state
+        self._queue_id: Optional[str] = None
+        self._last_event_id: int = -1
+        self._event_task: Optional[asyncio.Task] = None
+        self._stopping: asyncio.Event = asyncio.Event()
 
     # ---------- lifecycle -------------------------------------------------
 
@@ -129,13 +146,19 @@ class ZulipAdapter(BasePlatformAdapter):
             )
             await self._client.connect()
             self._me = await self._client.get_me()
-            subs = await self._client.get_subscriptions()
-            self._streams_by_name = {s["name"]: s for s in subs}
+            await self._refresh_streams()
             logger.info(
                 "[zulip] connected as %s (%s) — %d subscribed streams",
                 self._me.get("full_name"),
                 self._me.get("email"),
                 len(self._streams_by_name),
+            )
+
+            # Register event queue and spawn loop
+            await self._register_queue()
+            self._stopping.clear()
+            self._event_task = asyncio.create_task(
+                self._event_loop(), name="zulip-event-loop",
             )
             return True
         except ZulipAPIError as e:
@@ -146,12 +169,172 @@ class ZulipAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        self._stopping.set()
+        if self._event_task is not None:
+            self._event_task.cancel()
+            try:
+                await self._event_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._event_task = None
+
+        if self._client is not None and self._queue_id is not None:
+            try:
+                await self._client.delete_event_queue(self._queue_id)
+            except Exception:
+                logger.debug("[zulip] error deleting event queue", exc_info=True)
+        self._queue_id = None
+
         if self._client is not None:
             try:
                 await self._client.close()
             except Exception:
                 logger.exception("[zulip] error during disconnect")
         self._client = None
+
+    # ---------- event queue ----------------------------------------------
+
+    async def _refresh_streams(self) -> None:
+        assert self._client is not None
+        subs = await self._client.get_subscriptions()
+        self._streams_by_name = {s["name"]: s for s in subs}
+        self._streams_by_id = {int(s["stream_id"]): s for s in subs}
+
+    async def _register_queue(self) -> None:
+        """Open a fresh event queue.  We listen for messages + reactions + updates."""
+        assert self._client is not None
+        resp = await self._client.register_event_queue(
+            event_types=["message", "update_message", "reaction"],
+        )
+        self._queue_id = resp["queue_id"]
+        self._last_event_id = int(resp.get("last_event_id", -1))
+        logger.info(
+            "[zulip] event queue registered: id=%s last_event_id=%s",
+            self._queue_id, self._last_event_id,
+        )
+
+    async def _event_loop(self) -> None:
+        """Long-poll events forever; reconnect with backoff on errors."""
+        backoff = _RECONNECT_BACKOFF_MIN
+        while not self._stopping.is_set():
+            try:
+                assert self._client is not None and self._queue_id is not None
+                events = await self._client.get_events(
+                    self._queue_id, self._last_event_id,
+                )
+                # Success: reset backoff
+                backoff = _RECONNECT_BACKOFF_MIN
+                for ev in events:
+                    self._last_event_id = max(self._last_event_id, int(ev.get("id", -1)))
+                    try:
+                        await self._handle_event(ev)
+                    except Exception:
+                        logger.exception("[zulip] error handling event %s", ev.get("type"))
+            except asyncio.CancelledError:
+                break
+            except ZulipAPIError as e:
+                if e.code == BAD_EVENT_QUEUE_CODE:
+                    logger.warning("[zulip] event queue expired; re-registering")
+                    try:
+                        await self._register_queue()
+                        backoff = _RECONNECT_BACKOFF_MIN
+                        continue
+                    except Exception:
+                        logger.exception("[zulip] re-register failed; backing off")
+                else:
+                    logger.error("[zulip] events API error: %s", e)
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
+            except Exception:
+                logger.exception("[zulip] event loop transient error")
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
+                # On any unknown crash, try to refresh the queue.
+                try:
+                    if self._client is not None:
+                        await self._register_queue()
+                except Exception:
+                    logger.debug("[zulip] post-error re-register failed", exc_info=True)
+        logger.info("[zulip] event loop stopped")
+
+    async def _sleep_with_jitter(self, base: float) -> None:
+        delay = base + random.uniform(0, base * 0.5)
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass  # normal — backoff elapsed
+
+    async def _handle_event(self, ev: dict) -> None:
+        etype = ev.get("type")
+        if etype == "message":
+            await self._handle_message_event(ev["message"])
+        elif etype == "update_message":
+            # M8 will use this for edit tracking. Log only for M2.
+            logger.debug("[zulip] update_message: %s", ev.get("message_id"))
+        elif etype == "reaction":
+            # M6 will dispatch reaction events to the agent. Log only for M2.
+            logger.debug("[zulip] reaction event: %s", ev)
+        elif etype == "subscription":
+            # Refresh our stream cache opportunistically
+            try:
+                await self._refresh_streams()
+            except Exception:
+                pass
+
+    async def _handle_message_event(self, m: dict) -> None:
+        """Dispatch one Zulip message to Hermes via self.handle_message()."""
+        sender_id = m.get("sender_id")
+        my_id = self._me.get("user_id")
+        if sender_id is not None and my_id is not None and int(sender_id) == int(my_id):
+            return  # self-filter
+
+        msg_type = m.get("type", "stream")
+        if msg_type == "stream":
+            stream_name = m.get("display_recipient") or ""
+            topic = (m.get("subject") or "").strip() or DEFAULT_TOPIC
+            chat_id = f"stream:{stream_name}"
+            parent_chat_id = chat_id
+            thread_id = topic
+            chat_name = f"#{stream_name}"
+            chat_type = "channel"
+            stream_descr = ""
+            sid = m.get("stream_id")
+            if sid is not None:
+                stream_descr = (self._streams_by_id.get(int(sid)) or {}).get("description", "")
+        else:
+            # direct / huddle: build a stable chat_id from the sorted set of
+            # sender + recipient user ids.
+            recipients = m.get("display_recipient") or []
+            user_ids = sorted({int(r["id"]) for r in recipients if "id" in r}) if isinstance(recipients, list) else []
+            if my_id is not None and int(my_id) not in user_ids:
+                user_ids = sorted(user_ids + [int(my_id)])
+            chat_id = "dm:" + ",".join(str(u) for u in user_ids)
+            parent_chat_id = None
+            thread_id = None
+            chat_name = "Zulip DM"
+            chat_type = "dm"
+            stream_descr = ""
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            user_id=str(m.get("sender_id", "")),
+            user_name=m.get("sender_full_name") or m.get("sender_email") or "unknown",
+            thread_id=thread_id,
+            chat_topic=stream_descr or None,
+            parent_chat_id=parent_chat_id,
+            message_id=str(m.get("id")),
+        )
+
+        event = MessageEvent(
+            text=m.get("content", "") or "",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=m,
+            message_id=str(m.get("id")),
+        )
+        await self.handle_message(event)
 
     # ---------- outbound --------------------------------------------------
 
@@ -182,8 +365,38 @@ class ZulipAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def send_typing(self, chat_id: str, thread_id: Optional[str] = None) -> None:
-        # M2: implement via POST /typing. No-op for M1.
-        return None
+        """Show a typing indicator to the user.
+
+        Zulip auto-clears after ~15s, so we only send the ``start`` op.
+        """
+        if not self._client:
+            return None
+        kind, val = _parse_chat_id(chat_id)
+        try:
+            if kind == "stream":
+                topic = thread_id or DEFAULT_TOPIC
+                stream_id = (self._streams_by_name.get(val) or {}).get("stream_id")
+                if stream_id is None:
+                    return None
+                await self._client._request(  # noqa: SLF001
+                    "POST",
+                    "/typing",
+                    data={
+                        "type": "stream",
+                        "op": "start",
+                        "stream_id": int(stream_id),
+                        "topic": topic,
+                    },
+                )
+            else:
+                recipients = [e.strip() for e in val.split(",") if e.strip()]
+                await self._client._request(  # noqa: SLF001
+                    "POST",
+                    "/typing",
+                    data={"type": "direct", "op": "start", "to": recipients},
+                )
+        except Exception:
+            logger.debug("[zulip] send_typing failed (non-fatal)", exc_info=True)
 
     async def send_image(
         self,

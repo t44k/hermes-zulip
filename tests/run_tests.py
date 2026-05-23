@@ -171,5 +171,125 @@ def run() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M2 tests: event dispatch
+# --------------------------------------------------------------------------- #
+
+def run_m2() -> int:
+    """Run after run() — assumes plugin already loaded."""
+    import asyncio
+    from gateway.config import PlatformConfig
+    from hermes_plugins.zulip.adapter import ZulipAdapter, DEFAULT_TOPIC
+
+    print("\nM2: message event dispatch")
+
+    cfg = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+    })
+    a = ZulipAdapter(cfg)
+    a._me = {"user_id": 11, "email": "ange-bot@example.com", "full_name": "Ange"}
+    a._streams_by_id = {7: {"name": "sandbox", "stream_id": 7, "description": "Test playground"}}
+    a._streams_by_name = {"sandbox": a._streams_by_id[7]}
+
+    dispatched: list = []
+
+    async def _capture(event):
+        dispatched.append(event)
+
+    # Patch handle_message to capture
+    a.handle_message = _capture  # type: ignore[method-assign]
+
+    # 1) Stream message from another user
+    asyncio.run(a._handle_message_event({
+        "id": 100,
+        "type": "stream",
+        "sender_id": 42,
+        "sender_email": "tamas@359.wtf",
+        "sender_full_name": "Tamas",
+        "display_recipient": "sandbox",
+        "subject": "auth-bug",
+        "stream_id": 7,
+        "content": "Hey Ange, the OAuth flow is broken.",
+        "timestamp": 1234567890,
+    }))
+    _check("dispatched 1 event", len(dispatched) == 1)
+    ev1 = dispatched[0]
+    _check("ev1.text", "OAuth" in ev1.text)
+    _check("ev1.chat_id = stream:sandbox", ev1.source.chat_id == "stream:sandbox")
+    _check("ev1.thread_id = auth-bug", ev1.source.thread_id == "auth-bug")
+    _check("ev1.parent_chat_id = stream:sandbox",
+           ev1.source.parent_chat_id == "stream:sandbox")
+    _check("ev1.chat_type = channel", ev1.source.chat_type == "channel")
+    _check("ev1.chat_topic = stream description",
+           ev1.source.chat_topic == "Test playground")
+    _check("ev1.user_name = Tamas", ev1.source.user_name == "Tamas")
+    _check("ev1.message_id = 100", ev1.source.message_id == "100")
+
+    # 2) Stream message with empty topic → DEFAULT_TOPIC
+    dispatched.clear()
+    asyncio.run(a._handle_message_event({
+        "id": 101, "type": "stream", "sender_id": 42,
+        "sender_full_name": "Tamas", "display_recipient": "sandbox",
+        "subject": "   ", "stream_id": 7, "content": "no topic test",
+    }))
+    _check("empty topic → DEFAULT_TOPIC",
+           dispatched[0].source.thread_id == DEFAULT_TOPIC)
+
+    # 3) Self message → filtered out
+    dispatched.clear()
+    asyncio.run(a._handle_message_event({
+        "id": 102, "type": "stream", "sender_id": 11,  # ← bot's own user_id
+        "sender_full_name": "Ange", "display_recipient": "sandbox",
+        "subject": "auth-bug", "stream_id": 7, "content": "echo",
+    }))
+    _check("self-message filtered", len(dispatched) == 0)
+
+    # 4) DM
+    dispatched.clear()
+    asyncio.run(a._handle_message_event({
+        "id": 103, "type": "direct", "sender_id": 42,
+        "sender_full_name": "Tamas",
+        "display_recipient": [
+            {"id": 42, "email": "tamas@359.wtf"},
+            {"id": 11, "email": "ange-bot@example.com"},
+        ],
+        "content": "private hi",
+    }))
+    _check("dm dispatched", len(dispatched) == 1)
+    _check("dm chat_id sorted users", dispatched[0].source.chat_id == "dm:11,42")
+    _check("dm chat_type", dispatched[0].source.chat_type == "dm")
+    _check("dm has no thread_id", dispatched[0].source.thread_id is None)
+
+    # 5) Two topics in the same stream produce DIFFERENT chat_id/thread_id combos
+    #    (the actual "two sessions" guarantee comes from gateway/session.py,
+    #    but we verify the source fields it consumes).
+    dispatched.clear()
+    asyncio.run(a._handle_message_event({
+        "id": 200, "type": "stream", "sender_id": 42, "sender_full_name": "Tamas",
+        "display_recipient": "sandbox", "subject": "future-plans",
+        "stream_id": 7, "content": "what about Q3?",
+    }))
+    asyncio.run(a._handle_message_event({
+        "id": 201, "type": "stream", "sender_id": 42, "sender_full_name": "Tamas",
+        "display_recipient": "sandbox", "subject": "current-bug",
+        "stream_id": 7, "content": "the test fails on macOS",
+    }))
+    _check("two topics dispatched", len(dispatched) == 2)
+    _check("topic 1 isolated", dispatched[0].source.thread_id == "future-plans")
+    _check("topic 2 isolated", dispatched[1].source.thread_id == "current-bug")
+    _check("both share stream chat_id",
+           dispatched[0].source.chat_id == dispatched[1].source.chat_id == "stream:sandbox")
+    _check("session key differs (chat_id+thread_id)",
+           (dispatched[0].source.chat_id, dispatched[0].source.thread_id)
+           != (dispatched[1].source.chat_id, dispatched[1].source.thread_id))
+
+    print(f"\nM2 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    rc1 = run()
+    rc2 = run_m2()
+    sys.exit(rc1 | rc2)

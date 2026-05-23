@@ -195,3 +195,61 @@ class ZulipClient:
             },
         )
         return int(resp["id"])
+
+    # ---- M2: event queue endpoints ------------------------------------
+
+    async def register_event_queue(
+        self,
+        event_types: list[str] | None = None,
+        narrow: list[list[str]] | None = None,
+        *,
+        all_public_streams: bool = False,
+    ) -> dict:
+        """Open a long-poll event queue.
+
+        Returns the full register response (queue_id, last_event_id, plus
+        whatever bootstrap state was requested by ``fetch_event_types`` —
+        we omit that field so the response is light).
+        """
+        data: dict[str, Any] = {
+            "event_types": event_types or ["message"],
+            "all_public_streams": all_public_streams,
+        }
+        if narrow is not None:
+            data["narrow"] = narrow
+        return await self._request("POST", "/register", data=data)
+
+    async def get_events(
+        self,
+        queue_id: str,
+        last_event_id: int,
+        *,
+        dont_block: bool = False,
+        timeout: float = 70.0,
+    ) -> list[dict]:
+        """Long-poll for new events.
+
+        Default ``timeout`` is 70s — Zulip itself caps long-polls at ~60s,
+        so we give the server a small margin to respond with a heartbeat
+        before our HTTP client times out.
+        """
+        resp = await self._request(
+            "GET",
+            "/events",
+            params={
+                "queue_id": queue_id,
+                "last_event_id": last_event_id,
+                "dont_block": "true" if dont_block else "false",
+            },
+            timeout=timeout,
+        )
+        return resp.get("events", [])
+
+    async def delete_event_queue(self, queue_id: str) -> None:
+        """Close an event queue (best-effort — ignore errors on shutdown)."""
+        try:
+            await self._request(
+                "DELETE", "/events", params={"queue_id": queue_id}, timeout=10.0,
+            )
+        except Exception:
+            logger.debug("[zulip] delete_event_queue failed (ignored)", exc_info=True)
