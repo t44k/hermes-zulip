@@ -323,6 +323,53 @@ class ZulipClient:
             data={"emoji_name": emoji_name},
         )
 
+    # ---- M8: edit + delete endpoints ----------------------------------
+
+    async def update_message(
+        self,
+        message_id: int,
+        *,
+        content: str | None = None,
+        topic: str | None = None,
+        propagate_mode: str | None = None,
+    ) -> dict:
+        """Edit a message's content and/or move it to a new topic.
+
+        ``propagate_mode`` controls how a topic-rename cascades to other
+        messages in the original topic. Accepted values:
+          * ``"change_one"``   — only this message (default)
+          * ``"change_later"`` — this message + later ones
+          * ``"change_all"``   — every message in the original topic
+
+        Only fields that are non-None are sent — Zulip rejects empty edits.
+        """
+        if content is None and topic is None:
+            raise ValueError("update_message: nothing to change (content and topic both None)")
+        data: dict[str, Any] = {}
+        if content is not None:
+            data["content"] = content
+        if topic is not None:
+            data["topic"] = topic
+            if propagate_mode is not None:
+                data["propagate_mode"] = propagate_mode
+        return await self._request(
+            "PATCH",
+            f"/messages/{int(message_id)}",
+            data=data,
+        )
+
+    async def delete_message(self, message_id: int) -> dict:
+        """Delete a message by id.
+
+        The bot can only delete its own messages unless the realm grants it
+        broader permissions. Zulip returns ``result=success`` on a no-op
+        delete (already-gone message) so callers don't need to special-case.
+        """
+        return await self._request(
+            "DELETE",
+            f"/messages/{int(message_id)}",
+        )
+
     async def get_message(self, message_id: int) -> dict:
         """Fetch a single message by id. Used to look up stream/topic for
         reaction routing (Zulip reaction events don't include narrow info)."""

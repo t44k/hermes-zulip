@@ -173,6 +173,68 @@ ZULIP_UPLOAD_IMAGE_SCHEMA = {
 }
 
 
+ZULIP_EDIT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_edit",
+        "description": (
+            "Edit one of your own previous Zulip messages in place. Use this "
+            "to (a) fix a typo or factual error without spamming a follow-up, "
+            "(b) progressively update a long streamed answer as new tokens "
+            "arrive, or (c) move a message to a different topic. At least "
+            "one of `content` or `topic` must be provided. Returns {success}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "integer",
+                    "description": "ID of the message to edit (use the [msg #N] prefix from the inbound event, or the message_id returned by zulip_post).",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "New message body (Zulip Markdown). Omit to leave the body unchanged.",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "New topic name. Omit to keep the current topic. Stream cannot be changed.",
+                },
+                "propagate_mode": {
+                    "type": "string",
+                    "enum": ["change_one", "change_later", "change_all"],
+                    "description": "When `topic` is set, controls cascade: change_one (just this), change_later (this + later), change_all (every msg in old topic). Default change_one.",
+                    "default": "change_one",
+                },
+            },
+            "required": ["message_id"],
+        },
+    },
+}
+
+ZULIP_DELETE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_delete",
+        "description": (
+            "Delete one of your own previous Zulip messages. Useful for "
+            "retracting an outdated or wrong reply. The bot can only delete "
+            "messages it sent (unless the realm grants broader rights). "
+            "Returns {success}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "integer",
+                    "description": "ID of the message to delete.",
+                },
+            },
+            "required": ["message_id"],
+        },
+    },
+}
+
+
 ZULIP_REACT_SCHEMA = {
     "type": "function",
     "function": {
@@ -362,6 +424,48 @@ async def _handle_zulip_react(args: dict, **_kwargs: Any) -> dict[str, Any]:
     return {"success": True, "message_id": int(msg_id), "emoji_name": emoji_name, "op": op}
 
 
+async def _handle_zulip_edit(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    msg_id = args.get("message_id")
+    content = args.get("content")
+    topic = args.get("topic")
+    propagate = args.get("propagate_mode") or "change_one"
+    if not msg_id:
+        return _err("message_id is required")
+    if content is None and not topic:
+        return _err("at least one of `content` or `topic` must be provided")
+    if propagate not in ("change_one", "change_later", "change_all"):
+        return _err("propagate_mode must be one of change_one|change_later|change_all")
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            await c.update_message(
+                int(msg_id),
+                content=content,
+                topic=topic,
+                propagate_mode=propagate if topic else None,
+            )
+        except ZulipAPIError as e:
+            return _err(str(e))
+    return {"success": True, "message_id": int(msg_id)}
+
+
+async def _handle_zulip_delete(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    msg_id = args.get("message_id")
+    if not msg_id:
+        return _err("message_id is required")
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            await c.delete_message(int(msg_id))
+        except ZulipAPIError as e:
+            return _err(str(e))
+    return {"success": True, "message_id": int(msg_id)}
+
+
 # --------------------------------------------------------------------------- #
 # Registration
 # --------------------------------------------------------------------------- #
@@ -373,6 +477,8 @@ _TOOLS = (
     ("zulip_list_topics",  ZULIP_LIST_TOPICS_SCHEMA,  _handle_zulip_list_topics,  "🧵"),
     ("zulip_upload_image", ZULIP_UPLOAD_IMAGE_SCHEMA, _handle_zulip_upload_image, "🖼️"),
     ("zulip_react",        ZULIP_REACT_SCHEMA,        _handle_zulip_react,        "✨"),
+    ("zulip_edit",         ZULIP_EDIT_SCHEMA,         _handle_zulip_edit,         "✏️"),
+    ("zulip_delete",       ZULIP_DELETE_SCHEMA,       _handle_zulip_delete,       "🗑️"),
 )
 
 

@@ -90,6 +90,14 @@ PLATFORM_HINT = (
     "Zulip Markdown is supported: **bold**, *italic*, `code`, ```code blocks```, "
     "tables, spoilers (||spoiler||), and @-mentions like @**Tamas**. "
     "Messages can be edited; long streamed responses update in place. "
+    "When you spot a typo or factual error in one of your own recent "
+    "messages, prefer `zulip_edit(message_id, content=...)` over sending a "
+    "follow-up correction — the bot's previous message_id is returned by "
+    "`zulip_post` and tagged on inbound edit events. Use "
+    "`zulip_delete(message_id)` to retract a wrong message entirely. When a "
+    "user edits one of their own messages you receive a synthetic event "
+    "`[<name> edited msg #N → <new text>]` — treat the new text as the "
+    "authoritative version and reply (or edit your prior reply) accordingly. "
     "For lightweight acknowledgements (e.g. confirming you saw a request "
     "before doing the work), call `zulip_react(message_id, emoji_name)` "
     "instead of posting a one-word reply. Common short names: thumbs_up, "
@@ -313,8 +321,7 @@ class ZulipAdapter(BasePlatformAdapter):
         if etype == "message":
             await self._handle_message_event(ev["message"])
         elif etype == "update_message":
-            # M8 will use this for edit tracking. Log only for M2.
-            logger.debug("[zulip] update_message: %s", ev.get("message_id"))
+            await self._handle_update_message_event(ev)
         elif etype == "reaction":
             await self._handle_reaction_event(ev)
         elif etype == "subscription":
@@ -519,6 +526,108 @@ class ZulipAdapter(BasePlatformAdapter):
                 "[zulip] seen-reaction remove failed for msg=%s emoji=%s",
                 msg_id, emoji, exc_info=True,
             )
+
+    async def _handle_update_message_event(self, ev: dict) -> None:
+        """Surface a user-initiated message edit as a synthetic agent event.
+
+        Zulip ``update_message`` event payload (relevant fields)::
+
+            {type: "update_message", message_id, user_id,
+             orig_content, content, rendered_content,
+             stream_id, orig_subject, subject, propagate_mode, ...}
+
+        Behaviour:
+          * Skip our own edits (``user_id == bot``) — those are echoes of
+            ``zulip_edit`` tool calls and would cause feedback loops.
+          * Skip topic-only renames (no ``content`` change) — noisy and not
+            actionable for the agent.
+          * Look up the target message to recover stream/topic/author so the
+            edit lands in the same Hermes session as the original.
+          * Dispatch a MessageEvent whose text is
+            ``[<user> edited msg #N → <new content>]``.
+        """
+        op_user = ev.get("user_id")
+        my_id = self._me.get("user_id")
+        if op_user is not None and my_id is not None and int(op_user) == int(my_id):
+            return  # self-edit echo
+
+        new_content = ev.get("content")
+        if new_content is None:
+            # Pure topic move / metadata-only edit — ignore.
+            return
+
+        msg_id = ev.get("message_id")
+        if msg_id is None or self._client is None:
+            return
+
+        try:
+            target = await self._client.get_message(int(msg_id))
+        except Exception:
+            logger.warning("[zulip] update_message: could not fetch message %s", msg_id)
+            return
+
+        # Route based on the (possibly-new) stream/topic of the edited message.
+        msg_type = target.get("type", "stream")
+        if msg_type == "stream":
+            stream_name = target.get("display_recipient") or ""
+            topic = (target.get("subject") or "").strip() or DEFAULT_TOPIC
+            chat_id = f"stream:{stream_name}"
+            parent_chat_id = chat_id
+            thread_id = topic
+            chat_name = f"#{stream_name}"
+            chat_type = "channel"
+        else:
+            recipients = target.get("display_recipient") or []
+            user_ids = sorted({int(r["id"]) for r in recipients if "id" in r}) if isinstance(recipients, list) else []
+            if my_id is not None and int(my_id) not in user_ids:
+                user_ids = sorted(user_ids + [int(my_id)])
+            chat_id = "dm:" + ",".join(str(u) for u in user_ids)
+            parent_chat_id = None
+            thread_id = None
+            chat_name = "Zulip DM"
+            chat_type = "dm"
+
+        editor_name = (
+            target.get("sender_full_name")
+            if target.get("sender_id") == op_user
+            else f"user:{op_user}"
+        )
+        # The Zulip event payload doesn't include the editor's name directly
+        # (only user_id). Fall back to the original sender's name when the
+        # edit was made by the author themselves; otherwise label by id.
+        if op_user is not None and target.get("sender_id") != op_user:
+            editor_name = f"user:{op_user}"
+        elif not editor_name:
+            editor_name = f"user:{op_user}"
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            user_id=str(op_user) if op_user is not None else "",
+            user_name=editor_name,
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+            message_id=f"edit:{msg_id}",
+        )
+
+        # Truncate the rebroadcast text — the agent doesn't need a 10KB diff
+        # spelled out, and the prefix makes the intent clear.
+        snippet = new_content if len(new_content) <= 2000 else new_content[:2000] + "…"
+        synthetic_text = f"[{editor_name} edited msg #{msg_id} → {snippet}]"
+
+        event = MessageEvent(
+            text=synthetic_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"update_message_event": ev, "target_message": target},
+            message_id=f"edit:{msg_id}",
+        )
+        logger.info(
+            "[zulip] edit on msg %s by user=%s — dispatched to session",
+            msg_id, op_user,
+        )
+        await self.handle_message(event)
 
     async def _handle_reaction_event(self, ev: dict) -> None:
         """Surface a user's reaction to the agent as a synthetic text message.

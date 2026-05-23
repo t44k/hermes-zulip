@@ -878,6 +878,199 @@ def run_m6_polish() -> int:
     return 0 if _failures == 0 else 1
 
 
+# --------------------------------------------------------------------------- #
+# M8 tests: message edit + delete (in + out)
+# --------------------------------------------------------------------------- #
+
+def run_m8() -> int:
+    """M8 — update_message event dispatch + zulip_edit / zulip_delete tools."""
+    import asyncio
+    import os as _os
+    from unittest.mock import AsyncMock, patch
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from hermes_plugins.zulip.adapter import ZulipAdapter
+    from hermes_plugins.zulip import tools as zt
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM8: inbound update_message dispatch")
+
+    cfg = PlatformConfig(enabled=True, extra={
+        "site": "https://zulip.example.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+    })
+    a = ZulipAdapter(cfg)
+    a._me = {"user_id": 11, "email": "ange-bot@example.com", "full_name": "Ange"}
+    a._streams_by_id = {7: {"name": "sandbox", "stream_id": 7}}
+    a._streams_by_name = {"sandbox": a._streams_by_id[7]}
+
+    # Don't trigger the auto-seen-reaction wrap during dispatch (we're testing
+    # routing, not the eye lifecycle); cleanest path is to stub handle_message.
+    captured: list = []
+    async def _capture(ev):
+        captured.append(ev)
+    a.handle_message = _capture  # type: ignore[method-assign]
+
+    user_msg = {
+        "id": 777, "sender_id": 8, "sender_full_name": "Tamas", "type": "stream",
+        "display_recipient": "sandbox", "subject": "auth-bug",
+    }
+    bot_msg = dict(user_msg, id=778, sender_id=11, sender_full_name="Ange")
+
+    class _StubClient:
+        target = user_msg
+        async def get_message(self, mid):
+            return type(self).target
+
+    a._client = _StubClient()
+
+    # 1) User edits their own message — dispatch synthetic event
+    ev_edit = {
+        "type": "update_message",
+        "message_id": 777,
+        "user_id": 8,
+        "content": "actually the bug is in auth.py line 42, not 41",
+        "orig_content": "the bug is in auth.py line 41",
+        "subject": "auth-bug",
+    }
+    asyncio.run(a._handle_update_message_event(ev_edit))
+    _check("user edit dispatched", len(captured) == 1)
+    if captured:
+        ev = captured[0]
+        _check("edit text mentions msg id", "msg #777" in ev.text)
+        _check("edit text contains new content",
+               "line 42" in ev.text)
+        _check("edit text labelled 'edited'", "edited" in ev.text.lower())
+        _check("edit routed to stream", ev.source.chat_id == "stream:sandbox")
+        _check("edit routed to topic", ev.source.thread_id == "auth-bug")
+        _check("edit message_id namespaced",
+               ev.source.message_id == "edit:777")
+        _check("edit user name = Tamas",
+               ev.source.user_name == "Tamas")
+
+    # 2) Bot's own edit echo — should NOT dispatch
+    captured.clear()
+    ev_self_edit = dict(ev_edit, user_id=11, message_id=778)
+    _StubClient.target = bot_msg
+    asyncio.run(a._handle_update_message_event(ev_self_edit))
+    _check("self-edit filtered", len(captured) == 0)
+
+    # 3) Topic-only rename (no content key) — should NOT dispatch
+    captured.clear()
+    _StubClient.target = user_msg
+    ev_topic_only = {
+        "type": "update_message", "message_id": 777, "user_id": 8,
+        "orig_subject": "old-name", "subject": "new-name",
+    }
+    asyncio.run(a._handle_update_message_event(ev_topic_only))
+    _check("topic-only edit filtered", len(captured) == 0)
+
+    # 4) Very long edit content gets truncated
+    captured.clear()
+    long_content = "x" * 5000
+    asyncio.run(a._handle_update_message_event(
+        dict(ev_edit, content=long_content)
+    ))
+    _check("long edit dispatched", len(captured) == 1)
+    if captured:
+        _check("long edit truncated under 2500 chars",
+               len(captured[0].text) < 2500)
+        _check("long edit ends with ellipsis",
+               captured[0].text.endswith("…]"))
+
+    # ---- zulip_edit tool ----
+    print("\nM8: zulip_edit tool")
+    saved = {k: _os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
+    try:
+        r = asyncio.run(zt._handle_zulip_edit({"message_id": 5, "content": "x"}))
+        _check("edit without env → error", r["success"] is False)
+        _check("edit env error mentions ZULIP_SITE", "ZULIP_SITE" in r["error"])
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                _os.environ[k] = v
+
+    _os.environ["ZULIP_SITE"] = "https://zulip.example.com"
+    _os.environ["ZULIP_EMAIL"] = "ange-bot@example.com"
+    _os.environ["ZULIP_API_KEY"] = "k"
+
+    fake_client = AsyncMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.update_message = AsyncMock(return_value={"result": "success"})
+    fake_client.delete_message = AsyncMock(return_value={"result": "success"})
+
+    # content-only edit
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_edit(
+            {"message_id": 42, "content": "fixed text"}
+        ))
+    _check("edit content-only success", r["success"] is True)
+    fake_client.update_message.assert_awaited_with(
+        42, content="fixed text", topic=None, propagate_mode=None,
+    )
+
+    # topic-only edit, propagate_mode forwarded
+    fake_client.update_message.reset_mock()
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_edit({
+            "message_id": 43, "topic": "renamed", "propagate_mode": "change_all",
+        }))
+    _check("edit topic-only success", r["success"] is True)
+    fake_client.update_message.assert_awaited_with(
+        43, content=None, topic="renamed", propagate_mode="change_all",
+    )
+
+    # neither content nor topic → error
+    r = asyncio.run(zt._handle_zulip_edit({"message_id": 1}))
+    _check("edit with nothing to change → error", not r["success"])
+
+    # invalid propagate_mode → error
+    r = asyncio.run(zt._handle_zulip_edit({
+        "message_id": 1, "topic": "x", "propagate_mode": "bogus",
+    }))
+    _check("edit invalid propagate_mode → error", not r["success"])
+
+    # missing message_id
+    r = asyncio.run(zt._handle_zulip_edit({"content": "x"}))
+    _check("edit missing message_id → error", not r["success"])
+
+    # ---- zulip_delete tool ----
+    print("\nM8: zulip_delete tool")
+    fake_client.delete_message.reset_mock()
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_delete({"message_id": 99}))
+    _check("delete success", r["success"] is True and r["message_id"] == 99)
+    fake_client.delete_message.assert_awaited_with(99)
+
+    r = asyncio.run(zt._handle_zulip_delete({}))
+    _check("delete missing message_id → error", not r["success"])
+
+    # ---- client.update_message guard ----
+    print("\nM8: client.update_message guards")
+    from hermes_plugins.zulip.client import ZulipClient
+    c_unused = ZulipClient("https://x", "e", "k")
+    try:
+        asyncio.run(c_unused.update_message(1))
+    except ValueError as e:
+        _check("client.update_message rejects empty edit",
+               "nothing to change" in str(e))
+    else:
+        _check("client.update_message rejects empty edit", False,
+               "expected ValueError")
+
+    # ---- Registry ----
+    names = [t[0] for t in zt._TOOLS]
+    _check("zulip_edit registered", "zulip_edit" in names)
+    _check("zulip_delete registered", "zulip_delete" in names)
+    _check("tool count == 8", len(names) == 8)
+
+    print(f"\nM8 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
@@ -885,4 +1078,5 @@ if __name__ == "__main__":
     rc4 = run_m5()
     rc5 = run_m6()
     rc6 = run_m6_polish()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6)
+    rc7 = run_m8()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7)
