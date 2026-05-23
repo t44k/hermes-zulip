@@ -177,7 +177,7 @@ ZULIP_UPLOAD_IMAGE_SCHEMA = {
 # Handlers (all async — registered with is_async=True)
 # --------------------------------------------------------------------------- #
 
-async def _handle_zulip_post(stream: str, topic: str, content: str) -> dict[str, Any]:
+async def _handle_zulip_post(stream: str, topic: str, content: str, **_kwargs: Any) -> dict[str, Any]:
     c = _client()
     if c is None:
         return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
@@ -197,7 +197,7 @@ async def _handle_zulip_post(stream: str, topic: str, content: str) -> dict[str,
     return {"success": True, "message_id": mid, "url": url}
 
 
-async def _handle_zulip_dm(recipients: list[str], content: str) -> dict[str, Any]:
+async def _handle_zulip_dm(recipients: list[str], content: str, **_kwargs: Any) -> dict[str, Any]:
     if not recipients:
         return _err("recipients must be a non-empty list of emails")
     c = _client()
@@ -211,7 +211,7 @@ async def _handle_zulip_dm(recipients: list[str], content: str) -> dict[str, Any
     return {"success": True, "message_id": mid}
 
 
-async def _handle_zulip_list_streams() -> dict[str, Any]:
+async def _handle_zulip_list_streams(**_kwargs: Any) -> dict[str, Any]:
     c = _client()
     if c is None:
         return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
@@ -231,7 +231,7 @@ async def _handle_zulip_list_streams() -> dict[str, Any]:
     return {"success": True, "streams": out, "count": len(out)}
 
 
-async def _handle_zulip_list_topics(stream: str, limit: int = 25) -> dict[str, Any]:
+async def _handle_zulip_list_topics(stream: str, limit: int = 25, **_kwargs: Any) -> dict[str, Any]:
     if limit < 1 or limit > 100:
         limit = max(1, min(limit, 100))
     c = _client()
@@ -257,7 +257,7 @@ async def _handle_zulip_list_topics(stream: str, limit: int = 25) -> dict[str, A
 
 
 async def _handle_zulip_upload_image(
-    stream: str, topic: str, path: str, caption: str = "",
+    stream: str, topic: str, path: str, caption: str = "", **_kwargs: Any,
 ) -> dict[str, Any]:
     if not os.path.isfile(path):
         return _err(f"file not found: {path}")

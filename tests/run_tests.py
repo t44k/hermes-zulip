@@ -409,6 +409,22 @@ def run_m4() -> int:
     _check("PLATFORM_HINT names zulip_post", "zulip_post" in HINT)
     _check("PLATFORM_HINT names zulip_list_topics", "zulip_list_topics" in HINT)
 
+    # Regression: every handler must accept task_id (and any future) kwargs
+    # injected by the Hermes tool dispatcher. We don't run them — just confirm
+    # the signature accepts the extra kwarg without TypeError. (run_m4 in this
+    # process has stubbed mode set; the real handlers refuse upfront when
+    # ZULIP_SITE is missing.)
+    import inspect
+    from hermes_plugins.zulip.tools import (
+        _handle_zulip_post, _handle_zulip_dm, _handle_zulip_list_streams,
+        _handle_zulip_list_topics, _handle_zulip_upload_image,
+    )
+    for fn in (_handle_zulip_post, _handle_zulip_dm, _handle_zulip_list_streams,
+               _handle_zulip_list_topics, _handle_zulip_upload_image):
+        sig = inspect.signature(fn)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        _check(f"{fn.__name__} accepts **kwargs (task_id forward-compat)", has_var_kw)
+
     print(f"\nM4 results: {_passes} passed, {_failures} failed")
     return 0 if _failures == 0 else 1
 
