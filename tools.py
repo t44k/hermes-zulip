@@ -315,6 +315,267 @@ ZULIP_REACT_SCHEMA = {
 }
 
 
+ZULIP_CREATE_CHANNEL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_create_channel",
+        "description": (
+            "Create a Zulip channel (stream) and/or subscribe users to it. "
+            "If the channel already exists, this just adds principals to it. "
+            "The bot itself is always subscribed. Pass `principals` to "
+            "invite people at creation time (emails or numeric user_ids). "
+            "Set `invite_only=true` for a private channel. "
+            "Requires stream-creation rights on the bot account. "
+            "Returns {success, created, already_subscribed, subscribed, url}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Channel (stream) name. Use plain text, no leading '#'.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Short description shown in the channel header.",
+                },
+                "invite_only": {
+                    "type": "boolean",
+                    "description": "If true, create a private (invite-only) channel. Default false.",
+                    "default": False,
+                },
+                "principals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional users to subscribe alongside the bot. Each item is "
+                        "either an email address or a numeric user_id (as a string). "
+                        "Use `zulip_list_users` to resolve names → emails."
+                    ),
+                },
+                "announce": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, post an announcement in the realm's notification "
+                        "channel when a new public channel is created. Default false."
+                    ),
+                    "default": False,
+                },
+                "history_public_to_subscribers": {
+                    "type": "boolean",
+                    "description": (
+                        "For invite_only channels: whether new subscribers can read "
+                        "history from before they joined. Defaults to Zulip's realm "
+                        "default if omitted."
+                    ),
+                },
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+
+ZULIP_INVITE_TO_CHANNEL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_invite_to_channel",
+        "description": (
+            "Subscribe one or more users to an existing Zulip channel. "
+            "Same endpoint as `zulip_create_channel` but intended for "
+            "channels that already exist. Principals are emails or "
+            "numeric user_ids (as strings). For private channels, the "
+            "bot must already be subscribed (or be an admin). "
+            "Returns {success, subscribed, already_subscribed}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stream": {
+                    "type": "string",
+                    "description": "Channel (stream) name to invite users to.",
+                },
+                "principals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Users to invite — emails or numeric user_ids (as strings). At least one required.",
+                },
+            },
+            "required": ["stream", "principals"],
+        },
+    },
+}
+
+
+ZULIP_UNSUBSCRIBE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_unsubscribe",
+        "description": (
+            "Unsubscribe from a Zulip channel. Without `principals`, the "
+            "bot unsubscribes itself. With `principals`, removes those "
+            "users from the channel (requires admin or stream-admin role). "
+            "This does NOT delete or archive the channel — use "
+            "`zulip_archive_channel` for that. Returns {success, removed, not_removed}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stream": {
+                    "type": "string",
+                    "description": "Channel (stream) name to unsubscribe from.",
+                },
+                "principals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional users to unsubscribe instead of the bot itself — "
+                        "emails or numeric user_ids (as strings)."
+                    ),
+                },
+            },
+            "required": ["stream"],
+        },
+    },
+}
+
+
+ZULIP_ARCHIVE_CHANNEL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_archive_channel",
+        "description": (
+            "Archive (delete) a Zulip channel. This is admin-only on "
+            "most realms — if the bot lacks the role the API returns an "
+            "error which is surfaced to you. Archiving is reversible "
+            "from the Zulip web UI but not from this tool. "
+            "Returns {success, stream_id}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stream": {
+                    "type": "string",
+                    "description": "Channel (stream) name to archive.",
+                },
+            },
+            "required": ["stream"],
+        },
+    },
+}
+
+
+ZULIP_LIST_USERS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_list_users",
+        "description": (
+            "List users in the Zulip realm. Use this to resolve a person's "
+            "name to their email/user_id before inviting them to a channel. "
+            "Returns {success, users: [{user_id, email, full_name, is_bot, is_active}], count}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "search": {
+                    "type": "string",
+                    "description": (
+                        "Optional case-insensitive substring filter applied to "
+                        "full_name and email. Omit to return everyone."
+                    ),
+                },
+                "include_bots": {
+                    "type": "boolean",
+                    "description": "Include bot accounts in results. Default false.",
+                    "default": False,
+                },
+                "include_inactive": {
+                    "type": "boolean",
+                    "description": "Include deactivated users. Default false.",
+                    "default": False,
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+
+ZULIP_BUTTONS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "zulip_buttons",
+        "description": (
+            "Send a Zulip message with clickable reply buttons (uses Zulip's "
+            "built-in `zform` widget). When a user clicks a button, the "
+            "configured `reply` string is sent back to the channel as a new "
+            "message *from that user* — the agent will receive it as an "
+            "ordinary inbound message and can act on it. "
+            "**Important caveats:** "
+            "(1) Buttons render only in the Zulip web and desktop apps; "
+            "mobile + 3rd-party clients see the plain-text fallback. "
+            "(2) Choices are radio-style only — no free-text input, no date "
+            "pickers, no multi-select. "
+            "(3) Prefix every `reply` with a stable slash token "
+            "(e.g. `/approval`, `/confirm`, `/cancel`) so the agent can "
+            "pattern-match outstanding forms; with trigger_mode=mention_only, "
+            "replies starting with a configured prefix bypass the mention gate. "
+            "Provide either (stream + topic) OR dm_to. Returns {success, message_id, url?}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stream": {
+                    "type": "string",
+                    "description": "Stream name (omit when sending as a DM).",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic name (required when stream is set).",
+                },
+                "dm_to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Recipient emails for a DM. Mutually exclusive with stream.",
+                },
+                "heading": {
+                    "type": "string",
+                    "description": "Short question shown above the buttons (also used in the text fallback).",
+                },
+                "choices": {
+                    "type": "array",
+                    "description": "Buttons to render, max 10. Each choice needs label + reply.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "Visible button text (e.g. 'yes', 'no', 'needs review').",
+                            },
+                            "reply": {
+                                "type": "string",
+                                "description": "Message text sent on click. Prefix with a slash token like '/approval v0.3 yes'.",
+                            },
+                        },
+                        "required": ["label", "reply"],
+                    },
+                    "minItems": 1,
+                    "maxItems": 10,
+                },
+                "fallback_text": {
+                    "type": "string",
+                    "description": (
+                        "Optional text body shown on non-web clients. If omitted, "
+                        "an auto-rendering of heading + numbered choices is used."
+                    ),
+                },
+            },
+            "required": ["heading", "choices"],
+        },
+    },
+}
+
+
 # --------------------------------------------------------------------------- #
 # Handlers (all async — registered with is_async=True)
 # --------------------------------------------------------------------------- #
@@ -574,19 +835,337 @@ async def _handle_zulip_fetch(args: dict, **_kwargs: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# M13: channel + user management handlers
+# --------------------------------------------------------------------------- #
+
+def _principals_typed(raw: Any) -> list[str | int] | None:
+    """Normalise a principals list — numeric strings become ints (user_id).
+
+    Accepts ``None``, an actual list, or a JSON-encoded string (some tool
+    bridges pass array args through as their JSON text rather than decoding).
+    A bare string that doesn't parse as a JSON list is wrapped as ``[raw]`` so
+    a single email like ``"alice@example.com"`` still works.
+    """
+    if raw is None or raw == "" or raw == []:
+        return None
+    # Some MCP / tool bridges hand us the JSON text of the array, not the
+    # decoded list. Try to decode before iterating — otherwise we'd iterate
+    # the characters of the JSON string ('[', '"', 'd', '8', ...) which is
+    # how the original M13 smoke test produced a 400 from Zulip.
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
+            import json as _json
+            try:
+                raw = _json.loads(s)
+            except Exception:
+                raw = [s]
+        else:
+            raw = [s]
+    if not isinstance(raw, list):
+        raise ValueError(f"principals must be a list, got {type(raw).__name__}")
+    out: list[str | int] = []
+    for item in raw:
+        if isinstance(item, int):
+            out.append(item)
+            continue
+        s = str(item).strip()
+        if not s:
+            continue
+        if s.isdigit():
+            out.append(int(s))
+        else:
+            out.append(s)
+    return out or None
+
+
+async def _handle_zulip_create_channel(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    name = args.get("name", "").strip()
+    if not name:
+        return _err("name is required")
+    description = args.get("description")
+    invite_only = bool(args.get("invite_only", False))
+    announce = bool(args.get("announce", False))
+    hpts = args.get("history_public_to_subscribers")
+    principals = _principals_typed(args.get("principals"))
+
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            resp = await c.create_or_subscribe_stream(
+                name,
+                description=description,
+                invite_only=invite_only,
+                principals=principals,
+                announce=announce,
+                history_public_to_subscribers=hpts,
+            )
+        except ZulipAPIError as e:
+            return _err(str(e))
+
+    site = os.getenv("ZULIP_SITE", "").rstrip("/")
+    from urllib.parse import quote
+    url = f"{site}/#narrow/stream/{quote(name, safe='')}" if site else None
+    return {
+        "success": True,
+        "created": not bool(resp.get("already_subscribed")) or bool(resp.get("subscribed")),
+        "subscribed": resp.get("subscribed", {}),
+        "already_subscribed": resp.get("already_subscribed", {}),
+        "unauthorized": resp.get("unauthorized", []),
+        "url": url,
+    }
+
+
+async def _handle_zulip_invite_to_channel(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = args.get("stream", "").strip()
+    principals = _principals_typed(args.get("principals"))
+    if not stream:
+        return _err("stream is required")
+    if not principals:
+        return _err("principals must be a non-empty list of emails or user_ids")
+
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            resp = await c.create_or_subscribe_stream(stream, principals=principals)
+        except ZulipAPIError as e:
+            return _err(str(e))
+    return {
+        "success": True,
+        "subscribed": resp.get("subscribed", {}),
+        "already_subscribed": resp.get("already_subscribed", {}),
+        "unauthorized": resp.get("unauthorized", []),
+    }
+
+
+async def _handle_zulip_unsubscribe(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = args.get("stream", "").strip()
+    principals = _principals_typed(args.get("principals"))
+    if not stream:
+        return _err("stream is required")
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            resp = await c.unsubscribe_from_stream([stream], principals=principals)
+        except ZulipAPIError as e:
+            return _err(str(e))
+    return {
+        "success": True,
+        "removed": resp.get("removed", []),
+        "not_removed": resp.get("not_removed", []),
+    }
+
+
+async def _handle_zulip_archive_channel(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = args.get("stream", "").strip()
+    if not stream:
+        return _err("stream is required")
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            stream_id = await c.get_stream_id(stream)
+            await c.archive_stream(stream_id)
+        except ZulipAPIError as e:
+            return _err(str(e))
+    return {"success": True, "stream_id": stream_id, "stream": stream}
+
+
+async def _handle_zulip_list_users(args: dict | None = None, **_kwargs: Any) -> dict[str, Any]:
+    args = args or {}
+    search = (args.get("search") or "").strip().lower()
+    include_bots = bool(args.get("include_bots", False))
+    include_inactive = bool(args.get("include_inactive", False))
+
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            members = await c.get_users()
+        except ZulipAPIError as e:
+            return _err(str(e))
+
+    out: list[dict[str, Any]] = []
+    for m in members:
+        if not include_bots and m.get("is_bot"):
+            continue
+        if not include_inactive and not m.get("is_active", True):
+            continue
+        full_name = m.get("full_name", "") or ""
+        email = m.get("email", "") or m.get("delivery_email", "") or ""
+        if search and search not in full_name.lower() and search not in email.lower():
+            continue
+        out.append({
+            "user_id": m.get("user_id"),
+            "email": email,
+            "full_name": full_name,
+            "is_bot": bool(m.get("is_bot")),
+            "is_active": bool(m.get("is_active", True)),
+        })
+    return {"success": True, "users": out, "count": len(out)}
+
+
+# --------------------------------------------------------------------------- #
 # Registration
 # --------------------------------------------------------------------------- #
 
+# --- M14: zform / button widgets ------------------------------------------- #
+
+# Slash-prefix tokens that, when a stream message starts with one of them,
+# bypass the trigger_mode=mention_only gate (so button-click replies wake the
+# agent without users needing to embed an @-mention in the configured reply).
+# Read by adapter._handle_message_event via _zulip_widget_reply_prefixes().
+DEFAULT_WIDGET_REPLY_PREFIXES = ("/approval", "/confirm", "/cancel", "/zform")
+
+
+def _widget_reply_prefixes() -> tuple[str, ...]:
+    """Effective allow-list. Overridable by env ``ZULIP_WIDGET_REPLY_PREFIXES``
+    (comma-separated)."""
+    raw = os.getenv("ZULIP_WIDGET_REPLY_PREFIXES")
+    if not raw:
+        return DEFAULT_WIDGET_REPLY_PREFIXES
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+def is_widget_reply(content: str) -> bool:
+    """True if ``content`` looks like a zform button-click reply.
+
+    Used by the adapter to bypass the mention_only gate. Public so the adapter
+    can import it.
+    """
+    if not content:
+        return False
+    head = content.lstrip()
+    return any(head.startswith(p) for p in _widget_reply_prefixes())
+
+
+def _build_zform_widget_content(heading: str, choices: list[dict]) -> dict:
+    """Build the ``widget_content`` payload for a zform multiple-choice widget.
+
+    Each choice: ``{"label": str, "reply": str}``. We translate to Zulip's
+    internal schema (``short_name``, ``long_name``, ``reply``, ``type``).
+    Short names are auto-assigned A, B, C, … (zform uses them as the "tag"
+    label rendered next to the button text).
+    """
+    LETTERS = "ABCDEFGHIJ"  # max 10 enforced by schema
+    out_choices = []
+    for i, ch in enumerate(choices):
+        out_choices.append({
+            "type": "multiple_choice",
+            "short_name": LETTERS[i] if i < len(LETTERS) else str(i + 1),
+            "long_name": str(ch.get("label", "")).strip() or LETTERS[i],
+            "reply": str(ch.get("reply", "")).strip(),
+        })
+    return {
+        "widget_type": "zform",
+        "extra_data": {
+            "type": "choices",
+            "heading": heading,
+            "choices": out_choices,
+        },
+    }
+
+
+def _build_fallback_text(heading: str, choices: list[dict]) -> str:
+    """Auto-render a readable text fallback for non-web clients."""
+    lines = [heading.strip(), ""]
+    for i, ch in enumerate(choices):
+        tag = "ABCDEFGHIJ"[i] if i < 10 else str(i + 1)
+        label = str(ch.get("label", "")).strip()
+        reply = str(ch.get("reply", "")).strip()
+        lines.append(f"  **{tag}.** {label}  — reply with `{reply}`")
+    lines.append("")
+    lines.append("_(Click a button in the Zulip web/desktop app, or send "
+                 "the reply text manually.)_")
+    return "\n".join(lines)
+
+
+async def _handle_zulip_buttons(args: dict, **_kwargs: Any) -> dict[str, Any]:
+    stream = (args.get("stream") or "").strip()
+    topic = (args.get("topic") or "").strip()
+    dm_to = args.get("dm_to") or []
+    heading = (args.get("heading") or "").strip()
+    choices = args.get("choices") or []
+    fallback_text = args.get("fallback_text")
+
+    if not heading:
+        return _err("heading is required")
+    if not choices or not isinstance(choices, list):
+        return _err("choices must be a non-empty list")
+    if len(choices) > 10:
+        return _err("max 10 choices supported by Zulip's zform widget")
+    for i, ch in enumerate(choices):
+        if not isinstance(ch, dict):
+            return _err(f"choices[{i}] must be an object with label + reply")
+        if not ch.get("label") or not ch.get("reply"):
+            return _err(f"choices[{i}] missing label or reply")
+
+    # Routing: stream+topic XOR dm_to
+    use_stream = bool(stream)
+    use_dm = bool(dm_to)
+    if use_stream == use_dm:
+        return _err("provide either (stream+topic) OR dm_to, not both / neither")
+    if use_stream and not topic:
+        return _err("topic is required when stream is set")
+
+    widget_content = _build_zform_widget_content(heading, choices)
+    content = (
+        fallback_text
+        if isinstance(fallback_text, str) and fallback_text.strip()
+        else _build_fallback_text(heading, choices)
+    )
+
+    c = _client()
+    if c is None:
+        return _err("ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY not set")
+    async with c:
+        try:
+            if use_stream:
+                mid = await c.send_stream_message(
+                    stream, topic, content, widget_content=widget_content,
+                )
+            else:
+                mid = await c.send_direct_message(
+                    list(dm_to), content, widget_content=widget_content,
+                )
+        except ZulipAPIError as e:
+            return _err(str(e))
+
+    out: dict[str, Any] = {"success": True, "message_id": mid}
+    if use_stream:
+        site = os.getenv("ZULIP_SITE", "").rstrip("/")
+        from urllib.parse import quote
+        out["url"] = (
+            f"{site}/#narrow/stream/{quote(stream, safe='')}"
+            f"/topic/{quote(topic, safe='')}/near/{mid}"
+        )
+    return out
+
+
 _TOOLS = (
-    ("zulip_post",         ZULIP_POST_SCHEMA,         _handle_zulip_post,         "💬"),
-    ("zulip_dm",           ZULIP_DM_SCHEMA,           _handle_zulip_dm,           "📩"),
-    ("zulip_list_streams", ZULIP_LIST_STREAMS_SCHEMA, _handle_zulip_list_streams, "📋"),
-    ("zulip_list_topics",  ZULIP_LIST_TOPICS_SCHEMA,  _handle_zulip_list_topics,  "🧵"),
-    ("zulip_upload_image", ZULIP_UPLOAD_IMAGE_SCHEMA, _handle_zulip_upload_image, "🖼️"),
-    ("zulip_react",        ZULIP_REACT_SCHEMA,        _handle_zulip_react,        "✨"),
-    ("zulip_edit",         ZULIP_EDIT_SCHEMA,         _handle_zulip_edit,         "✏️"),
-    ("zulip_delete",       ZULIP_DELETE_SCHEMA,       _handle_zulip_delete,       "🗑️"),
-    ("zulip_fetch",        ZULIP_FETCH_SCHEMA,        _handle_zulip_fetch,        "📜"),
+    ("zulip_post",               ZULIP_POST_SCHEMA,               _handle_zulip_post,               "💬"),
+    ("zulip_dm",                 ZULIP_DM_SCHEMA,                 _handle_zulip_dm,                 "📩"),
+    ("zulip_list_streams",       ZULIP_LIST_STREAMS_SCHEMA,       _handle_zulip_list_streams,       "📋"),
+    ("zulip_list_topics",        ZULIP_LIST_TOPICS_SCHEMA,        _handle_zulip_list_topics,        "🧵"),
+    ("zulip_upload_image",       ZULIP_UPLOAD_IMAGE_SCHEMA,       _handle_zulip_upload_image,       "🖼️"),
+    ("zulip_react",              ZULIP_REACT_SCHEMA,              _handle_zulip_react,              "✨"),
+    ("zulip_edit",               ZULIP_EDIT_SCHEMA,               _handle_zulip_edit,               "✏️"),
+    ("zulip_delete",             ZULIP_DELETE_SCHEMA,             _handle_zulip_delete,             "🗑️"),
+    ("zulip_fetch",              ZULIP_FETCH_SCHEMA,              _handle_zulip_fetch,              "📜"),
+    ("zulip_create_channel",     ZULIP_CREATE_CHANNEL_SCHEMA,     _handle_zulip_create_channel,     "📢"),
+    ("zulip_invite_to_channel",  ZULIP_INVITE_TO_CHANNEL_SCHEMA,  _handle_zulip_invite_to_channel,  "➕"),
+    ("zulip_unsubscribe",        ZULIP_UNSUBSCRIBE_SCHEMA,        _handle_zulip_unsubscribe,        "🚪"),
+    ("zulip_archive_channel",    ZULIP_ARCHIVE_CHANNEL_SCHEMA,    _handle_zulip_archive_channel,    "📦"),
+    ("zulip_list_users",         ZULIP_LIST_USERS_SCHEMA,         _handle_zulip_list_users,         "👥"),
+    ("zulip_buttons",            ZULIP_BUTTONS_SCHEMA,            _handle_zulip_buttons,            "🔘"),
 )
 
 

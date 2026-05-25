@@ -1307,7 +1307,7 @@ def run_m9() -> int:
     # 5) Registry
     names = [t[0] for t in zt._TOOLS]
     _check("zulip_fetch registered", "zulip_fetch" in names)
-    _check("tool count == 9", len(names) == 9)
+    _check("tool count >= 9 (M9 baseline)", len(names) >= 9)
 
     # 6) client.get_messages anchor validation
     print("\nM9: client.get_messages guards")
@@ -1726,6 +1726,344 @@ def run_m12() -> int:
     return 0 if _failures == 0 else 1
 
 
+def run_m13() -> int:
+    """M13 — channel + user management. Focus: _principals_typed regression.
+
+    The original bug: when the MCP/tool bridge passed `principals` to the
+    handler as the JSON *text* of an array (e.g. '["a@b.com"]') instead of a
+    decoded list, the old _principals_typed iterated the characters of the
+    string. Numeric-looking chars got cast to int and Zulip rejected the
+    request with `principals[N] is not a string`. This test pins the fix.
+    """
+    from hermes_plugins.zulip import tools as zt
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM13: _principals_typed normalisation")
+
+    _check("None → None", zt._principals_typed(None) is None)
+    _check("empty list → None", zt._principals_typed([]) is None)
+    _check("empty string → None", zt._principals_typed("") is None)
+
+    _check("list of emails passes through",
+           zt._principals_typed(["a@b.com", "c@d.com"]) == ["a@b.com", "c@d.com"])
+    _check("numeric strings → int (user_id)",
+           zt._principals_typed(["8", "42"]) == [8, 42])
+    _check("mixed emails + ids",
+           zt._principals_typed(["a@b.com", 7, "9"]) == ["a@b.com", 7, 9])
+
+    # The regression: JSON-encoded array as a single string.
+    _check("JSON-string array decoded, not char-iterated",
+           zt._principals_typed('["d853211@gmail.com"]') == ["d853211@gmail.com"])
+    _check("JSON-string with mixed types decoded",
+           zt._principals_typed('["a@b.com", 8]') == ["a@b.com", 8])
+
+    # Bare single-email string → wrap as single-item list.
+    _check("bare email string wrapped",
+           zt._principals_typed("alice@example.com") == ["alice@example.com"])
+
+    # Non-list / non-string types blow up loudly rather than silently mangling.
+    try:
+        zt._principals_typed({"not": "a list"})
+        _check("dict raises ValueError", False, "expected raise")
+    except ValueError:
+        _check("dict raises ValueError", True)
+
+    return 0 if _failures == 0 else 1
+
+
+# --------------------------------------------------------------------------- #
+# M14 tests: zform / button widgets
+# --------------------------------------------------------------------------- #
+
+def run_m14() -> int:
+    """M14 — `zulip_buttons` tool, widget_content plumbing, mention-gate bypass."""
+    import asyncio
+    import json as _json
+    import os
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\nM14: zform / button widgets")
+
+    from hermes_plugins.zulip import tools as zt
+    from hermes_plugins.zulip.client import ZulipClient
+
+    # ----- payload builders -------------------------------------------------
+    payload = zt._build_zform_widget_content(
+        "Approve v0.3?",
+        [
+            {"label": "yes",          "reply": "/approval v0.3 yes"},
+            {"label": "no",           "reply": "/approval v0.3 no"},
+            {"label": "needs review", "reply": "/approval v0.3 review"},
+        ],
+    )
+    _check("widget_type == zform", payload["widget_type"] == "zform")
+    _check("extra_data.type == choices", payload["extra_data"]["type"] == "choices")
+    _check("heading echoed", payload["extra_data"]["heading"] == "Approve v0.3?")
+    choices = payload["extra_data"]["choices"]
+    _check("3 choices", len(choices) == 3)
+    _check("short_names A/B/C", [c["short_name"] for c in choices] == ["A", "B", "C"])
+    _check("long_names from labels",
+           [c["long_name"] for c in choices] == ["yes", "no", "needs review"])
+    _check("type=multiple_choice on each",
+           all(c["type"] == "multiple_choice" for c in choices))
+    _check("reply strings preserved",
+           [c["reply"] for c in choices][0] == "/approval v0.3 yes")
+
+    # Fallback text contains heading + every reply string
+    fb = zt._build_fallback_text(
+        "Question?",
+        [{"label": "Yes", "reply": "/confirm yes"},
+         {"label": "No",  "reply": "/confirm no"}],
+    )
+    _check("fallback contains heading", "Question?" in fb)
+    _check("fallback contains tag A.", "**A.**" in fb)
+    _check("fallback contains tag B.", "**B.**" in fb)
+    _check("fallback contains reply text", "/confirm yes" in fb)
+
+    # ----- is_widget_reply --------------------------------------------------
+    _check("is_widget_reply /approval", zt.is_widget_reply("/approval v0.3 yes"))
+    _check("is_widget_reply /confirm",  zt.is_widget_reply("/confirm anything"))
+    _check("is_widget_reply /cancel",   zt.is_widget_reply("/cancel"))
+    _check("is_widget_reply /zform",    zt.is_widget_reply("/zform foo"))
+    _check("plain msg not a reply",     not zt.is_widget_reply("hey ange"))
+    _check("empty msg not a reply",     not zt.is_widget_reply(""))
+    _check("leading whitespace ok",     zt.is_widget_reply("   /approval x"))
+    # Env override
+    os.environ["ZULIP_WIDGET_REPLY_PREFIXES"] = "/vote,/pick"
+    try:
+        _check("env override picks /vote",  zt.is_widget_reply("/vote A"))
+        _check("env override drops /approval", not zt.is_widget_reply("/approval x"))
+    finally:
+        os.environ.pop("ZULIP_WIDGET_REPLY_PREFIXES", None)
+
+    # ----- handler validation errors (no env needed) ------------------------
+    saved = {k: os.environ.pop(k, None) for k in ("ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY")}
+    try:
+        r = asyncio.run(zt._handle_zulip_buttons({}))
+        _check("empty args rejected (heading)", r["success"] is False and "heading" in r["error"])
+
+        r = asyncio.run(zt._handle_zulip_buttons({"heading": "Q?", "choices": []}))
+        _check("empty choices rejected", r["success"] is False)
+
+        r = asyncio.run(zt._handle_zulip_buttons(
+            {"heading": "Q?", "choices": [{"label": "x", "reply": "/c x"}] * 11}
+        ))
+        _check("too many choices rejected", r["success"] is False and "10" in r["error"])
+
+        r = asyncio.run(zt._handle_zulip_buttons(
+            {"heading": "Q?", "choices": [{"label": "x"}]}  # missing reply
+        ))
+        _check("missing reply rejected", r["success"] is False and "reply" in r["error"])
+
+        r = asyncio.run(zt._handle_zulip_buttons(
+            {"heading": "Q?", "choices": [{"label": "x", "reply": "/c x"}]}
+        ))
+        _check("no routing (neither stream nor dm) rejected",
+               r["success"] is False and "stream" in r["error"].lower())
+
+        r = asyncio.run(zt._handle_zulip_buttons({
+            "heading": "Q?", "stream": "sandbox",
+            "choices": [{"label": "x", "reply": "/c x"}],
+        }))
+        _check("stream without topic rejected",
+               r["success"] is False and "topic" in r["error"].lower())
+
+        r = asyncio.run(zt._handle_zulip_buttons({
+            "heading": "Q?", "stream": "s", "topic": "t", "dm_to": ["a@b.com"],
+            "choices": [{"label": "x", "reply": "/c x"}],
+        }))
+        _check("both stream and dm rejected", r["success"] is False)
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    # ----- success path: stream + widget_content plumbed through ------------
+    os.environ["ZULIP_SITE"] = "https://example.zulip.com"
+    os.environ["ZULIP_EMAIL"] = "ange-bot@example.com"
+    os.environ["ZULIP_API_KEY"] = "k"
+
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.send_stream_message = AsyncMock(return_value=999)
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_buttons({
+            "stream": "sandbox", "topic": "approvals",
+            "heading": "Deploy?",
+            "choices": [
+                {"label": "yes", "reply": "/approval deploy yes"},
+                {"label": "no",  "reply": "/approval deploy no"},
+            ],
+        }))
+    _check("stream send success", r["success"] is True)
+    _check("message_id surfaced", r["message_id"] == 999)
+    _check("url has narrow", "/#narrow/stream/sandbox/topic/approvals/near/999" in r.get("url", ""))
+    # Verify widget_content kwarg shape
+    call = fake_client.send_stream_message.await_args
+    _check("send_stream_message called positionally with stream/topic/content",
+           call.args[0] == "sandbox" and call.args[1] == "approvals")
+    wc = call.kwargs.get("widget_content")
+    _check("widget_content kwarg present", isinstance(wc, dict))
+    _check("widget_content.widget_type=zform", wc and wc.get("widget_type") == "zform")
+    _check("widget_content has 2 choices",
+           wc and len(wc["extra_data"]["choices"]) == 2)
+    # Fallback content auto-built and contains heading
+    _check("fallback content has heading", "Deploy?" in call.args[2])
+
+    # ----- success path: DM -------------------------------------------------
+    fake_client.send_direct_message = AsyncMock(return_value=1234)
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_buttons({
+            "dm_to": ["tamas@359.wtf"],
+            "heading": "Confirm?",
+            "choices": [{"label": "ok", "reply": "/confirm ok"}],
+            "fallback_text": "Custom fallback text.",
+        }))
+    _check("dm success", r["success"] is True)
+    _check("dm message_id", r["message_id"] == 1234)
+    _check("dm has no url", "url" not in r)
+    call_dm = fake_client.send_direct_message.await_args
+    _check("dm recipients passed", call_dm.args[0] == ["tamas@359.wtf"])
+    _check("custom fallback used", call_dm.args[1] == "Custom fallback text.")
+    _check("dm widget_content kwarg", isinstance(call_dm.kwargs.get("widget_content"), dict))
+
+    # ----- API errors bubble cleanly ---------------------------------------
+    fake_client.send_stream_message = AsyncMock(
+        side_effect=zt.ZulipAPIError(400, "BAD", "no such stream")
+    )
+    with patch.object(zt, "ZulipClient", return_value=fake_client):
+        r = asyncio.run(zt._handle_zulip_buttons({
+            "stream": "ghost", "topic": "t",
+            "heading": "Q?",
+            "choices": [{"label": "x", "reply": "/c x"}],
+        }))
+    _check("API error bubbles", r["success"] is False and "no such stream" in r["error"])
+
+    # ----- client.send_stream_message form-data shape ----------------------
+    # Verify that when widget_content is passed, _request receives it in `data`
+    # as a dict (so the request layer JSON-encodes it for form submission).
+    async def _capture_request():
+        cli = ZulipClient("https://example.zulip.com", "e", "k")
+        captured = {}
+
+        async def _fake(method, path, *, data=None, **kw):
+            captured["method"] = method
+            captured["path"] = path
+            captured["data"] = data
+            return {"result": "success", "id": 7}
+
+        cli._request = _fake  # type: ignore[assignment]
+        mid = await cli.send_stream_message(
+            "sandbox", "t", "hello",
+            widget_content={"widget_type": "zform", "extra_data": {"x": 1}},
+        )
+        return mid, captured
+
+    mid, cap = asyncio.run(_capture_request())
+    _check("client send returns id", mid == 7)
+    _check("client posts to /messages",
+           cap["method"] == "POST" and cap["path"] == "/messages")
+    _check("client data has widget_content dict",
+           isinstance(cap["data"].get("widget_content"), dict))
+    _check("client data has widget_type=zform",
+           cap["data"]["widget_content"]["widget_type"] == "zform")
+    # And that _request would JSON-encode dict values (sanity-check the
+    # encoding pass already covered by client.py's _request).
+    encoded = _json.dumps(cap["data"]["widget_content"])
+    _check("widget_content is JSON-serialisable", "zform" in encoded)
+
+    # ----- tool registration -----------------------------------------------
+    registered: list = []
+
+    class _Ctx:
+        def register_tool(self, **kw):
+            registered.append(kw)
+
+    zt.register_tools(_Ctx())
+    _check("zulip_buttons registered",
+           any(t["name"] == "zulip_buttons" for t in registered))
+    bt = next((t for t in registered if t["name"] == "zulip_buttons"), None)
+    _check("zulip_buttons is async", bt and bt["is_async"] is True)
+    _check("zulip_buttons in hermes-zulip toolset",
+           bt and bt["toolset"] == "hermes-zulip")
+    _check("zulip_buttons has requires_env",
+           bt and "ZULIP_SITE" in bt["requires_env"])
+
+    # ----- handler calling convention pinning (no positional unpack) -------
+    import inspect
+    sig = inspect.signature(zt._handle_zulip_buttons)
+    params = list(sig.parameters.values())
+    _check("handler accepts **kwargs (task_id forward-compat)",
+           any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params))
+    positional = [p for p in params if p.kind in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )]
+    _check("handler takes single positional args dict",
+           len(positional) == 1 and positional[0].name == "args")
+    try:
+        asyncio.run(zt._handle_zulip_buttons({}, task_id="probe"))
+        _check("handler(args, task_id=…) does not TypeError", True)
+    except TypeError as e:
+        _check("handler(args, task_id=…) does not TypeError", False, str(e))
+
+    # ----- adapter mention-gate bypass -------------------------------------
+    from gateway.config import PlatformConfig
+    from hermes_plugins.zulip.adapter import ZulipAdapter
+
+    cfg = PlatformConfig(enabled=True, extra={
+        "site": "https://example.zulip.com",
+        "email": "ange-bot@example.com",
+        "api_key": "k",
+        "trigger_mode": "mention_only",
+    })
+    a = ZulipAdapter(cfg)
+    a._me = {"user_id": 11, "email": "ange-bot@example.com", "full_name": "Ange"}
+    a._streams_by_id = {7: {"name": "sandbox", "stream_id": 7, "description": ""}}
+    a._streams_by_name = {"sandbox": a._streams_by_id[7]}
+
+    dispatched: list = []
+
+    async def _capture(event):
+        dispatched.append(event)
+
+    a.handle_message = _capture  # type: ignore[method-assign]
+
+    base_msg = {
+        "type": "stream", "sender_id": 42, "sender_full_name": "Tamas",
+        "display_recipient": "sandbox", "subject": "approvals",
+        "stream_id": 7,
+    }
+
+    # Plain message in mention_only — DROPPED
+    asyncio.run(a._handle_message_event({**base_msg, "id": 500, "content": "hey there"}))
+    _check("mention_only drops plain stream msg", len(dispatched) == 0)
+
+    # /approval reply — BYPASSED through
+    asyncio.run(a._handle_message_event({**base_msg, "id": 501, "content": "/approval deploy yes"}))
+    _check("mention_only bypasses /approval", len(dispatched) == 1)
+    _check("bypassed event text contains slash command",
+           "/approval" in dispatched[0].text)
+
+    # /confirm reply — also bypassed
+    dispatched.clear()
+    asyncio.run(a._handle_message_event({**base_msg, "id": 502, "content": "/confirm yes"}))
+    _check("mention_only bypasses /confirm", len(dispatched) == 1)
+
+    # Non-allowlisted slash (/poll is NOT in DEFAULT_WIDGET_REPLY_PREFIXES) — DROPPED
+    dispatched.clear()
+    asyncio.run(a._handle_message_event({**base_msg, "id": 503, "content": "/poll Tea?\nA\nB"}))
+    _check("mention_only still drops /poll (not in allow-list)",
+           len(dispatched) == 0)
+
+    print(f"\nM14 results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_m2()
@@ -1738,4 +2076,6 @@ if __name__ == "__main__":
     rc9 = run_m7()
     rc10 = run_m10()
     rc11 = run_m12()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8 | rc9 | rc10 | rc11)
+    rc12 = run_m13()
+    rc13 = run_m14()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6 | rc7 | rc8 | rc9 | rc10 | rc11 | rc12 | rc13)

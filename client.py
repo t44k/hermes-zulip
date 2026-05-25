@@ -165,35 +165,43 @@ class ZulipClient:
         stream: str,
         topic: str,
         content: str,
+        *,
+        widget_content: dict | None = None,
     ) -> int:
-        """Send a message to ``stream > topic``. Returns the new message id."""
-        resp = await self._request(
-            "POST",
-            "/messages",
-            data={
-                "type": "stream",
-                "to": stream,
-                "topic": topic,
-                "content": content,
-            },
-        )
+        """Send a message to ``stream > topic``. Returns the new message id.
+
+        When ``widget_content`` is supplied, the Zulip server attaches it to
+        the message and the web/desktop client renders the corresponding
+        interactive widget (e.g. a ``zform`` with reply buttons). Other
+        clients fall back to ``content``.
+        """
+        data: dict[str, Any] = {
+            "type": "stream",
+            "to": stream,
+            "topic": topic,
+            "content": content,
+        }
+        if widget_content is not None:
+            data["widget_content"] = widget_content  # _request will json.dumps it
+        resp = await self._request("POST", "/messages", data=data)
         return int(resp["id"])
 
     async def send_direct_message(
         self,
         recipient_emails: list[str],
         content: str,
+        *,
+        widget_content: dict | None = None,
     ) -> int:
-        """Send a 1:1 or group DM."""
-        resp = await self._request(
-            "POST",
-            "/messages",
-            data={
-                "type": "direct",
-                "to": recipient_emails,
-                "content": content,
-            },
-        )
+        """Send a 1:1 or group DM. Optional ``widget_content`` see send_stream_message."""
+        data: dict[str, Any] = {
+            "type": "direct",
+            "to": recipient_emails,
+            "content": content,
+        }
+        if widget_content is not None:
+            data["widget_content"] = widget_content
+        resp = await self._request("POST", "/messages", data=data)
         return int(resp["id"])
 
     # ---- M2: event queue endpoints ------------------------------------
@@ -419,3 +427,83 @@ class ZulipClient:
             import json as _json
             params["narrow"] = _json.dumps(narrow)
         return await self._request("GET", "/messages", params=params)
+
+    # ---- M13: channel + user management -------------------------------
+
+    async def create_or_subscribe_stream(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        invite_only: bool = False,
+        principals: list[str | int] | None = None,
+        announce: bool = False,
+        history_public_to_subscribers: bool | None = None,
+    ) -> dict:
+        """Create a stream (channel) and/or subscribe principals to it.
+
+        Endpoint: ``POST /users/me/subscriptions``. Zulip auto-creates the
+        stream if it doesn't exist (provided the bot has stream-creation
+        rights). The bot itself is always subscribed; ``principals`` extends
+        the subscription to other users (by email or user_id).
+
+        Returns the raw payload, which includes ``subscribed`` and
+        ``already_subscribed`` keyed by principal email.
+        """
+        sub: dict[str, Any] = {"name": name}
+        if description is not None:
+            sub["description"] = description
+        data: dict[str, Any] = {"subscriptions": [sub]}
+        # Zulip wants lowercase JSON booleans for these form fields.
+        if invite_only:
+            data["invite_only"] = "true"
+        if announce:
+            data["announce"] = "true"
+        if history_public_to_subscribers is not None:
+            data["history_public_to_subscribers"] = (
+                "true" if history_public_to_subscribers else "false"
+            )
+        if principals:
+            data["principals"] = principals
+        return await self._request("POST", "/users/me/subscriptions", data=data)
+
+    async def unsubscribe_from_stream(
+        self,
+        streams: list[str],
+        *,
+        principals: list[str | int] | None = None,
+    ) -> dict:
+        """Unsubscribe the bot (or ``principals``) from ``streams``.
+
+        Endpoint: ``DELETE /users/me/subscriptions``. Without ``principals``
+        the bot unsubscribes itself; with ``principals`` it unsubscribes the
+        named users (requires admin or the bot being a stream admin).
+        """
+        data: dict[str, Any] = {"subscriptions": streams}
+        if principals:
+            data["principals"] = principals
+        return await self._request("DELETE", "/users/me/subscriptions", data=data)
+
+    async def get_stream_id(self, stream_name: str) -> int:
+        """Resolve a stream name → numeric stream_id (needed for archive)."""
+        resp = await self._request(
+            "GET", "/get_stream_id", params={"stream": stream_name},
+        )
+        return int(resp["stream_id"])
+
+    async def archive_stream(self, stream_id: int) -> dict:
+        """Archive (delete) a stream by id. Admin-only on most realms.
+
+        Endpoint: ``DELETE /streams/{stream_id}``. Archiving is reversible
+        from the Zulip web UI but not via this client.
+        """
+        return await self._request("DELETE", f"/streams/{int(stream_id)}")
+
+    async def get_users(self) -> list[dict]:
+        """List all users in the realm.
+
+        Endpoint: ``GET /users``. Returns every user; filter on
+        ``is_active`` / ``is_bot`` in the caller as needed.
+        """
+        resp = await self._request("GET", "/users")
+        return resp.get("members", [])

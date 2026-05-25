@@ -431,11 +431,21 @@ class ZulipAdapter(BasePlatformAdapter):
         # addressed to the bot.
         if self.trigger_mode == "mention_only" and msg_type == "stream":
             if not self._is_addressed_to_bot(m):
-                logger.debug(
-                    "[zulip] mention_only: skipping unaddressed msg %s in #%s",
-                    m.get("id"), m.get("display_recipient"),
-                )
-                return
+                # M14: button-click replies (zform) bypass the mention gate
+                # if their content starts with a registered slash prefix.
+                # This lets the agent wake on /approval, /confirm, etc. without
+                # users having to bake @-mentions into every configured reply.
+                try:
+                    from .tools import is_widget_reply
+                    _bypass = is_widget_reply(m.get("content") or "")
+                except Exception:
+                    _bypass = False
+                if not _bypass:
+                    logger.debug(
+                        "[zulip] mention_only: skipping unaddressed msg %s in #%s",
+                        m.get("id"), m.get("display_recipient"),
+                    )
+                    return
 
         if msg_type == "stream":
             stream_name = m.get("display_recipient") or ""
