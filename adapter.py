@@ -335,6 +335,9 @@ class ZulipAdapter(BasePlatformAdapter):
                         continue
                     except Exception:
                         logger.exception("[zulip] re-register failed; backing off")
+                elif e.code == "non_json" and e.status in (500, 502, 503, 504):
+                    # Transient server errors (restarts, deploys) — warn, don't error
+                    logger.warning("[zulip] server %d (transient): %s", e.status, e.msg)
                 else:
                     logger.error("[zulip] events API error: %s", e)
                 await self._sleep_with_jitter(backoff)
@@ -949,7 +952,9 @@ class ZulipAdapter(BasePlatformAdapter):
             logger.exception("[zulip] edit_message crashed")
             return SendResult(success=False, error=str(e))
 
-    async def send_typing(self, chat_id: str, thread_id: Optional[str] = None) -> None:
+    async def send_typing(
+        self, chat_id: str, thread_id: Optional[str] = None, **_kwargs: Any
+    ) -> None:
         """Show a typing indicator to the user.
 
         Zulip auto-clears after ~15s, so we only send the ``start`` op.

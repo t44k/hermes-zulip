@@ -24,6 +24,7 @@ Later milestones add:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
@@ -137,7 +138,12 @@ class ZulipClient:
         try:
             payload = resp.json()
         except Exception:
-            raise ZulipAPIError(resp.status_code, "non_json", resp.text[:500])
+            # Non-JSON response (e.g. 502/503 HTML error pages during restarts).
+            # Extract a short human-readable summary instead of dumping raw HTML.
+            body = resp.text or ""
+            title_m = re.search(r"<title[^>]*>([^<]+)</title>", body, re.IGNORECASE)
+            summary = title_m.group(1).strip() if title_m else body[:120]
+            raise ZulipAPIError(resp.status_code, "non_json", summary)
 
         if payload.get("result") != "success":
             raise ZulipAPIError(
